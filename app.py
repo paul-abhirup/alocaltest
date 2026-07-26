@@ -1036,10 +1036,29 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
             location = st.text_input("Location", key="ja_location", placeholder="e.g. London / Remote")
         with c2:
             yoe = st.number_input("Years of Experience", min_value=0, max_value=50, value=0, step=1, key="ja_yoe")
+            supported_countries = getattr(ja, "SUPPORTED_COUNTRIES", {
+                "all": "🌍 All Countries (Global)",
+                "us": "🇺🇸 United States",
+                "gb": "🇬🇧 United Kingdom",
+                "in": "🇮🇳 India",
+                "ca": "🇨🇦 Canada",
+                "au": "🇦🇺 Australia",
+                "de": "🇩🇪 Germany",
+                "fr": "🇫🇷 France",
+                "nl": "🇳🇱 Netherlands",
+                "es": "🇪🇸 Spain",
+                "it": "🇮🇹 Italy",
+                "br": "🇧🇷 Brazil",
+                "mx": "🇲🇽 Mexico",
+                "pl": "🇵🇱 Poland",
+                "za": "🇿🇦 South Africa",
+                "sg": "🇸🇬 Singapore",
+                "nz": "🇳🇿 New Zealand",
+            })
             country = st.selectbox(
                 "Country / Region",
-                options=list(ja.SUPPORTED_COUNTRIES.keys()),
-                format_func=lambda x: str(ja.SUPPORTED_COUNTRIES.get(x, x.upper())),
+                options=list(supported_countries.keys()),
+                format_func=lambda x: str(supported_countries.get(x, (x or "").upper())),
                 index=0,
                 key="ja_country"
             )
@@ -1360,10 +1379,8 @@ def _render_application_suite(email: str, resume_text: str, jd_to_use: str, titl
 
     # Template selection
     templates = {
-        "professional": "👔 Professional (Traditional ATS)",
-        "modern": "✨ Modern (Clean & Contemporary)",
-        "minimal": "📝 Minimal (Simple & Direct)",
-        "executive": "💼 Executive (Leadership Focus)"
+        "classic_serif": "📜 Executive Serif (IIT / Classic Standard)",
+        "modern_sans": "⚡ Modern Tech (Snabbit / Product Standard)",
     }
     col_t1, col_t2 = st.columns([1, 2])
     with col_t1:

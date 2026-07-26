@@ -199,6 +199,21 @@ class CVOptimization(BaseModel):
     optimized_content: str
     suggestions: list
 
+def standardize_cv_formatting(cv_text: str) -> str:
+    """Standardize bullet symbols to '•' and clean up section headers per docs/resume_fix_prompt.md."""
+    if not cv_text:
+        return ""
+    lines = cv_text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^[•\-\*]\s*(SUMMARY|EDUCATION|EXPERIENCE|WORK EXPERIENCE|PROJECTS|TECHNICAL SKILLS|ACHIEVEMENTS)\b', stripped, re.IGNORECASE):
+            line = re.sub(r'^[•\-\*]\s*', '', stripped)
+        elif re.match(r'^[-\*]\s+', stripped) and not stripped.startswith("•"):
+            line = re.sub(r'^[-\*]\s+', '• ', stripped)
+        cleaned_lines.append(line)
+    return '\n'.join(cleaned_lines)
+
 def extract_resume_text(uploaded_file):
     """Extract text from uploaded resume file"""
     if uploaded_file.name.endswith(".pdf"):
@@ -601,81 +616,34 @@ def generate_cv(
                 ],
                 temperature=0.2
             )
-            optimized_cv = response.choices[0].message.content
-            # ✅ Post-process and return
-            optimized_cv = clean_cv_content(optimized_cv)
-            optimized_cv = enforce_page_limit(optimized_cv)
-            return optimized_cv.strip()
+            raw_cv = response.choices[0].message.content or ""
+            return _finalize_optimized_cv(raw_cv, job_description)
 
         # ✅ Gemini Flow
         else:
-
             response = model.generate_content(
-            prompt_5,
-            generation_config={
-                "temperature": 0.2,
-                "response_mime_type": "text/plain"
-            }
+                prompt_5,
+                generation_config={
+                    "temperature": 0.2,
+                    "response_mime_type": "text/plain"
+                }
             )
-        
-        # Handle different response conditions
+
         if not response:
             raise Exception("No response received from AI")
-        
-        if response.candidates and len(response.candidates) > 0:
+
+        raw_cv = ""
+        if hasattr(response, "text") and response.text:
+            raw_cv = response.text
+        elif response.candidates and len(response.candidates) > 0:
             candidate = response.candidates[0]
-            if candidate.finish_reason.name == 'MAX_TOKENS':
-                # Try to get partial content
-                if candidate.content and candidate.content.parts:
-                    partial_text = ""
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            partial_text += part.text
-                    if partial_text:
-                        optimized_cv = partial_text
-                    else:
-                        raise Exception("MAX_TOKENS reached and no partial content available")
-                else:
-                    raise Exception("MAX_TOKENS reached and no content available")
-            elif not response.text:
-                raise Exception("AI response was empty")
-            else:
-                optimized_cv = response.text
-        else:
-            raise Exception("No candidates in response")
-        
+            if candidate.content and candidate.content.parts:
+                raw_cv = "".join([p.text for p in candidate.content.parts if hasattr(p, 'text') and p.text])
 
-        
-        # Clean up the response
-        optimized_cv = clean_cv_content(optimized_cv)
-        optimized_cv = enforce_page_limit(optimized_cv)
+        if not raw_cv:
+            raise Exception("AI response was empty")
 
-        from utils import extract_keywords_from_text
-
-        jd_keywords = extract_keywords_from_text(job_description)
-
-        def bold_keywords_in_work_exp(cv_text, keywords):
-            if "WORK EXPERIENCE:" not in cv_text:
-                return cv_text
-
-            parts = cv_text.split("WORK EXPERIENCE:")
-            before = parts[0]
-            after = parts[1]
-
-            lines = after.split('\n')
-            bolded_lines = []
-            for line in lines:
-                if line.startswith("•") or "|" in line:
-                    for kw in keywords:
-                        pattern = r'\b(' + re.escape(kw) + r')\b'
-                        line = re.sub(pattern, r'**\1**', line, flags=re.IGNORECASE)
-                bolded_lines.append(line)
-
-            return before + "WORK EXPERIENCE:\n" + '\n'.join(bolded_lines)
-
-        optimized_cv = bold_keywords_in_work_exp(optimized_cv, jd_keywords)
-
-        return optimized_cv.strip()
+        return _finalize_optimized_cv(raw_cv, job_description)
         
     except Exception as e:
         raise Exception(f"Failed to generate CV: {str(e)}")

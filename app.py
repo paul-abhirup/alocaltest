@@ -661,27 +661,41 @@ def _render_job_results_unified(result, resume_text):
 
     for i, j in enumerate(jobs):
         with st.container(border=True):
-            st.subheader(j.title)
-            st.markdown(f"**{j.company or '—'}** · {j.location or '—'}")
+            j_title = getattr(j, "title", "") if not isinstance(j, dict) else j.get("title", "")
+            j_company = getattr(j, "company", "") if not isinstance(j, dict) else j.get("company", "")
+            j_location = getattr(j, "location", "") if not isinstance(j, dict) else j.get("location", "")
+            j_match_score = getattr(j, "match_score", None) if not isinstance(j, dict) else j.get("match_score")
+            j_remote_type = getattr(j, "remote_type", "") if not isinstance(j, dict) else j.get("remote_type", "")
+            j_job_type = getattr(j, "job_type", "") if not isinstance(j, dict) else j.get("job_type", "")
+            j_salary = getattr(j, "salary", None) if not isinstance(j, dict) else j.get("salary")
+            j_seniority = getattr(j, "seniority", None) if not isinstance(j, dict) else j.get("seniority")
+            j_posted_date = getattr(j, "posted_date", "") if not isinstance(j, dict) else j.get("posted_date", "")
+            j_url = getattr(j, "url", "") if not isinstance(j, dict) else j.get("url", "")
+            j_desc = getattr(j, "description", "") if not isinstance(j, dict) else j.get("description", "")
+            j_why_matched = getattr(j, "why_matched", []) if not isinstance(j, dict) else j.get("why_matched", [])
+
+            st.subheader(j_title or "Job Position")
+            st.markdown(f"**{j_company or '—'}** · {j_location or '—'}")
             chips = []
-            if j.match_score is not None:
-                chips.append(f"🎯 {j.match_score}% match")
-            chips.append(f"🌍 {j.remote_type}")
-            if j.job_type and j.job_type != "—":
-                chips.append(f"💼 {j.job_type}")
-            if j.salary:
-                chips.append(f"💰 {j.salary}")
-            if j.seniority:
-                chips.append(f"📈 {j.seniority}")
-            if j.posted_date:
-                chips.append(f"🗓 {j.posted_date}")
+            if j_match_score is not None:
+                chips.append(f"🎯 {j_match_score}% match")
+            if j_remote_type:
+                chips.append(f"🌍 {j_remote_type}")
+            if j_job_type and j_job_type != "—":
+                chips.append(f"💼 {j_job_type}")
+            if j_salary:
+                chips.append(f"💰 {j_salary}")
+            if j_seniority:
+                chips.append(f"📈 {j_seniority}")
+            if j_posted_date:
+                chips.append(f"🗓 {j_posted_date}")
             st.caption(" · ".join(chips))
-            
-            if getattr(j, "why_matched", None):
+
+            if j_why_matched:
                 with st.expander("💡 Why this job?"):
-                    for bullet in j.why_matched:
+                    for bullet in j_why_matched:
                         st.markdown(f"- {bullet}")
-            
+
             col_opt, col_src = st.columns([2, 3])
             with col_opt:
                 btn_key = f"opt_job_btn_{i}"
@@ -692,18 +706,18 @@ def _render_job_results_unified(result, resume_text):
                         if not check_user_access(required_credits=3):
                             st.error("⚠️ Insufficient credits. You need 3 credits to run Gap Analysis & CV Optimization.")
                         else:
-                            st.session_state.active_job_url = j.url
+                            st.session_state.active_job_url = j_url
 
                             # Extract full job description if possible
                             from job_aggregator import fetch_full_job_description
                             full_jd = None
-                            if j.url:
+                            if j_url:
                                 with st.spinner("📄 Extracting full job description from source…"):
-                                    full_jd = fetch_full_job_description(j.url)
-                            
-                            st.session_state.job_description = full_jd or j.description or f"Role: {j.title} at {j.company}"
-                            st.session_state.target_job_title = j.title
-                            st.session_state.target_job_company = j.company
+                                    full_jd = fetch_full_job_description(j_url)
+
+                            st.session_state.job_description = full_jd or j_desc or f"Role: {j_title} at {j_company}"
+                            st.session_state.target_job_title = j_title
+                            st.session_state.target_job_company = j_company
 
                             jd_h = hash_jd(st.session_state.job_description)
                             saved = get_alignment_answers(email, jd_h)

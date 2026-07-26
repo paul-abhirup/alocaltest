@@ -201,11 +201,12 @@ class TestOrchestration(unittest.TestCase):
         self.assertIn("Remotive", res["jobs"][0].also_on)        # cross-source noted
 
     def test_scoring_applied_and_sorted(self):
-        good = make_job(url="https://job/a", description="python django postgres aws")
-        weak = make_job(url="https://job/b", description="marketing sales copywriting")
+        clear_cache()
+        good = make_job(url="https://job/a", company="Company A", description="python django postgres aws")
+        weak = make_job(url="https://job/b", company="Company B", description="documentation notes writing")
         res = search_jobs(SearchQuery(title="dev"),
                           resume_text="python django postgres backend engineer",
-                          sources=[FakeAdapter("s", [weak, good])])
+                          sources=[FakeAdapter("s_score", [weak, good])])
         self.assertEqual(res["jobs"][0].url, "https://job/a")    # higher match first
         self.assertGreater(res["jobs"][0].match_score, res["jobs"][1].match_score)
 
@@ -298,6 +299,35 @@ class TestHTMLScraper(unittest.TestCase):
 
     def test_fetch_full_description_none_on_empty(self):
         self.assertIsNone(ja.fetch_full_job_description(""))
+
+
+class TestTitleGuardrailAndRecency(unittest.TestCase):
+    def test_title_relevance_score(self):
+        # Exact/synonym match
+        self.assertEqual(ja.compute_title_relevance_score("Python Developer", "Senior Python Developer"), 100.0)
+        self.assertEqual(ja.compute_title_relevance_score("React Dev", "Frontend React Engineer"), 100.0)
+
+        # Irrelevant titles
+        self.assertEqual(ja.compute_title_relevance_score("Python Developer", "Sales Operations Executive"), 0.0)
+        self.assertEqual(ja.compute_title_relevance_score("Data Analyst", "Customer Support Specialist"), 0.0)
+
+    def test_is_title_relevant_drops_hoguspogus(self):
+        self.assertTrue(ja.is_title_relevant("Python Developer", "Senior Python Developer"))
+        self.assertFalse(ja.is_title_relevant("Python Developer", "Marketing Manager"))
+
+    def test_recency_scoring(self):
+        today_str = time.strftime("%Y-%m-%d")
+        self.assertEqual(ja.compute_recency_score(today_str), 100.0)
+        self.assertEqual(ja.compute_recency_score("2020-01-01"), 20.0)
+
+    def test_search_jobs_filters_irrelevant_jobs(self):
+        relevant = make_job(url="https://job/1", title="Senior Python Engineer")
+        irrelevant = make_job(url="https://job/2", title="Customer Support Lead")
+        res = search_jobs(SearchQuery(title="Python Developer"),
+                          sources=[FakeAdapter("s", [relevant, irrelevant])])
+        # Only relevant job should be shown
+        self.assertEqual(res["counts"]["shown"], 1)
+        self.assertEqual(res["jobs"][0].title, "Senior Python Engineer")
 
 
 if __name__ == "__main__":

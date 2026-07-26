@@ -677,6 +677,11 @@ def _render_job_results_unified(result, resume_text):
                 chips.append(f"🗓 {j.posted_date}")
             st.caption(" · ".join(chips))
             
+            if getattr(j, "why_matched", None):
+                with st.expander("💡 Why this job?"):
+                    for bullet in j.why_matched:
+                        st.markdown(f"- {bullet}")
+            
             col_opt, col_src = st.columns([2, 3])
             with col_opt:
                 btn_key = f"opt_job_btn_{i}"
@@ -1031,20 +1036,10 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
             location = st.text_input("Location", key="ja_location", placeholder="e.g. London / Remote")
         with c2:
             yoe = st.number_input("Years of Experience", min_value=0, max_value=50, value=0, step=1, key="ja_yoe")
-            country_names = {
-                "gb": "🇬🇧 United Kingdom",
-                "us": "🇺🇸 United States",
-                "in": "🇮🇳 India",
-                "ca": "🇨🇦 Canada",
-                "au": "🇦🇺 Australia",
-                "de": "🇩🇪 Germany",
-                "fr": "🇫🇷 France",
-                "nl": "🇳🇱 Netherlands"
-            }
             country = st.selectbox(
-                "Country (Adzuna)",
-                options=["gb", "us", "in", "ca", "au", "de", "fr", "nl"],
-                format_func=lambda x: str(country_names.get(x or "", (x or "").upper())),
+                "Country / Region",
+                options=list(ja.SUPPORTED_COUNTRIES.keys()),
+                format_func=lambda x: str(ja.SUPPORTED_COUNTRIES.get(x, x.upper())),
                 index=0,
                 key="ja_country"
             )

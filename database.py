@@ -10,25 +10,135 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _search_container(container, key: str):
+    """Safely search key in dict/AttrDict/Secrets object, case-insensitively."""
+    if container is None:
+        return None
+    try:
+        if key in container:
+            val = container[key]
+            if val is not None and str(val).strip() != "":
+                return str(val).strip()
+    except Exception:
+        pass
+
+    try:
+        target_lower = key.lower()
+        keys_iter = container.keys() if hasattr(container, "keys") else iter(container)
+        for k in keys_iter:
+            if str(k).lower() == target_lower:
+                val = container[k]
+                if val is not None and str(val).strip() != "":
+                    return str(val).strip()
+    except Exception:
+        pass
+
+    try:
+        if hasattr(container, key):
+            val = getattr(container, key)
+            if val is not None and not callable(val) and str(val).strip() != "":
+                return str(val).strip()
+    except Exception:
+        pass
+
+    return None
+
 def get_secret(key: str, default=None):
     """
-    Fetch secret from Streamlit secrets (st.secrets) or environment variables (os.getenv).
-    Supports top-level secrets and nested [postgres] section.
+    Exhaustively fetch a secret from Streamlit secrets (st.secrets) or OS environment variables.
     """
+    possible_keys = [key, key.lower(), key.upper()]
+    if key.startswith("DB_"):
+        short_key = key[3:]
+        possible_keys.extend([short_key, short_key.lower(), short_key.upper()])
+        if short_key.lower() == "name":
+            possible_keys.extend(["dbname", "database"])
+
+    # 1. Streamlit Secrets search
     try:
         import streamlit as st
         if hasattr(st, "secrets") and st.secrets is not None:
-            if key in st.secrets:
-                return st.secrets[key]
-            if "postgres" in st.secrets and isinstance(st.secrets["postgres"], (dict, st.secrets.__class__)):
-                if key in st.secrets["postgres"]:
-                    return st.secrets["postgres"][key]
-                lower_key = key.lower().replace("db_", "")
-                if lower_key in st.secrets["postgres"]:
-                    return st.secrets["postgres"][lower_key]
+            for pk in possible_keys:
+                val = _search_container(st.secrets, pk)
+                if val is not None:
+                    return val
+
+            sections = ["postgres", "postgresql", "database", "db"]
+            for sec_name in sections:
+                sec = _search_container(st.secrets, sec_name)
+                if sec is not None:
+                    try:
+                        sub_container = st.secrets[sec_name]
+                        for pk in possible_keys:
+                            val = _search_container(sub_container, pk)
+                            if val is not None:
+                                return val
+                    except Exception:
+                        pass
+
+            try:
+                if "connections" in st.secrets:
+                    conns = st.secrets["connections"]
+                    for pg_sec in ["postgresql", "postgres"]:
+                        if pg_sec in conns:
+                            for pk in possible_keys:
+                                val = _search_container(conns[pg_sec], pk)
+                                if val is not None:
+                                    return val
+            except Exception:
+                pass
     except Exception:
         pass
-    return os.getenv(key, default)
+
+    # 2. Environment variables search
+    for pk in possible_keys:
+        val = os.getenv(pk)
+        if val is not None and val.strip() != "":
+            return val.strip()
+
+    # 3. Postgres Standard Environment Variables
+    pg_env_map = {
+        "DB_HOST": ["PGHOST", "POSTGRES_HOST"],
+        "DB_PORT": ["PGPORT", "POSTGRES_PORT"],
+        "DB_NAME": ["PGDATABASE", "POSTGRES_DB"],
+        "DB_USER": ["PGUSER", "POSTGRES_USER"],
+        "DB_PASSWORD": ["PGPASSWORD", "POSTGRES_PASSWORD"],
+        "DB_SSLMODE": ["PGSSLMODE", "POSTGRES_SSLMODE"]
+    }
+    if key in pg_env_map:
+        for alt_env in pg_env_map[key]:
+            val = os.getenv(alt_env)
+            if val is not None and val.strip() != "":
+                return val.strip()
+
+    return default
+
+def get_db_config_summary():
+    """Return dict of current DB connection resolution for diagnostics (passwords masked)."""
+    db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL") or get_secret("DB_URL")
+    if db_url:
+        masked_url = db_url
+        if "@" in masked_url and ":" in masked_url:
+            try:
+                pre, post = masked_url.rsplit("@", 1)
+                proto, creds = pre.split("://", 1)
+                if ":" in creds:
+                    u, _ = creds.split(":", 1)
+                    masked_url = f"{proto}://{u}:****@{post}"
+            except Exception:
+                masked_url = "DATABASE_URL provided (password masked)"
+        return {"connection_mode": "URL", "url": masked_url}
+
+    host = get_secret("DB_HOST", "127.0.0.1")
+    return {
+        "connection_mode": "parameters",
+        "host": host,
+        "port": get_secret("DB_PORT", "5432"),
+        "database": get_secret("DB_NAME", get_secret("DB_DATABASE", "cvolvepro")),
+        "user": get_secret("DB_USER", get_secret("DB_USERNAME", "postgres")),
+        "sslmode": get_secret("DB_SSLMODE", "require" if host not in ("127.0.0.1", "localhost") else None),
+        "is_default_localhost": host in ("127.0.0.1", "localhost")
+    }
 
 def get_db_connection():
     db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL") or get_secret("DB_URL")

@@ -285,13 +285,15 @@ try:
     from database import seed_discount_codes
     seed_discount_codes()
 except Exception as e:
+    from database import get_db_config_summary
+    cfg_summary = get_db_config_summary()
     st.error("🚨 **Database Connection Error**")
     st.warning(
         "Could not connect to the PostgreSQL database.\n\n"
         "**If you deployed on Streamlit Cloud:**\n"
         "1. Go to your app dashboard on Streamlit Cloud.\n"
         "2. Click **Manage app** (lower right) -> **Settings** -> **Secrets**.\n"
-        "3. Add your remote PostgreSQL connection details in Secrets:\n\n"
+        "3. Paste your database credentials into **Secrets**:\n\n"
         "```toml\n"
         'DATABASE_URL = "postgresql://user:password@your-db-host.com:5432/cvolvepro?sslmode=require"\n'
         "```\n"
@@ -305,7 +307,8 @@ except Exception as e:
         'DB_SSLMODE = "require"\n'
         "```"
     )
-    with st.expander("Technical details / Error log"):
+    with st.expander("🔍 Detected Connection Settings & Error Log"):
+        st.write("**Resolved Connection Config:**", cfg_summary)
         st.code(str(e))
     st.stop()
 

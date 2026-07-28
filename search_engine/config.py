@@ -11,14 +11,12 @@ MIN_DESC_LENGTH_FOR_CONFIDENCE = 200 # Short descriptions get lower confidence
 # Composite scoring weights (must sum to 1.0)
 DEFAULT_WEIGHTS = {
     "title_match": 0.30,
-    "query_skill_match": 0.20,
+    "query_skill_match": 0.28,
     "resume_match": 0.15,
-    "semantic_similarity": 0.10,
-    "freshness": 0.10,
+    "freshness": 0.14,
     "company_quality": 0.05,
     "salary_match": 0.05,
     "description_quality": 0.03,
-    "personalization": 0.02,
 }
 
 # Negative keywords: Automatically reject titles containing these words unless user explicitly searched for them

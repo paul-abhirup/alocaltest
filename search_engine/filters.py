@@ -96,6 +96,80 @@ def is_employment_type_mismatched(wanted_work_types: list[str], job_remote_type:
     return False
 
 
+def is_location_mismatched(job_location: str, query_location: str = "", query_country: str = "") -> bool:
+    """Phase 7: Reject jobs located in a different country/region than requested (unless Worldwide Remote)."""
+    if not query_country and not query_location:
+        return False
+
+    q_country = (query_country or "").lower().strip()
+    if q_country == "all":
+        return False
+
+    loc_low = (job_location or "").lower().strip()
+    if not loc_low or loc_low == "—":
+        return False
+
+    if any(k in loc_low for k in ["worldwide", "anywhere", "global", "remote"]):
+        return False
+
+    country_map = {
+        "in": ["india", "bengaluru", "bangalore", "mumbai", "delhi", "hyderabad", "pune", "chennai", "gurgaon", "noida", "kolkata", "ahmedabad", "gurugram"],
+        "us": ["us", "usa", "united states", "america", "san francisco", "new york", "austin", "chicago", "seattle", "indiana", "indianapolis", "california", "texas", "florida", "ny", "tx", "wa", "fl", "il", "ma", "ca"],
+        "gb": ["gb", "uk", "united kingdom", "london", "england", "scotland", "wales", "manchester", "birmingham"],
+        "ca": ["ca", "canada", "toronto", "vancouver", "montreal", "ontario", "bc", "alberta"],
+        "de": ["de", "germany", "berlin", "munich", "hamburg", "frankfurt", "cologne"],
+        "fr": ["fr", "france", "paris", "lyon"],
+        "au": ["au", "australia", "sydney", "melbourne", "brisbane"],
+        "sg": ["sg", "singapore"],
+        "nz": ["nz", "new zealand", "auckland"],
+        "mx": ["mx", "mexico", "mexico city"],
+        "uy": ["uy", "uruguay", "montevideo"],
+        "br": ["br", "brazil", "sao paulo"],
+        "es": ["es", "spain", "madrid", "barcelona"],
+        "it": ["it", "italy", "rome", "milan"],
+        "pl": ["pl", "poland", "warsaw"],
+    }
+
+    target_terms = set()
+    if q_country in country_map:
+        target_terms.update(country_map[q_country])
+
+    q_loc_low = (query_location or "").lower().strip()
+    if q_loc_low:
+        target_terms.add(q_loc_low)
+        for c_code, terms in country_map.items():
+            if q_loc_low in terms:
+                target_terms.update(terms)
+                q_country = c_code
+
+    if not target_terms:
+        return False
+
+    has_target_match = False
+    for term in target_terms:
+        if len(term) <= 2:
+            if re.search(r"\b" + re.escape(term) + r"\b", loc_low):
+                has_target_match = True
+                break
+        else:
+            if term in loc_low:
+                has_target_match = True
+                break
+
+    for c_code, terms in country_map.items():
+        if c_code != q_country and q_country in country_map:
+            for t in terms:
+                if t not in target_terms:
+                    if len(t) <= 2:
+                        if re.search(r"\b" + re.escape(t) + r"\b", loc_low):
+                            return True
+                    else:
+                        if t in loc_low:
+                            return True
+
+    return not has_target_match
+
+
 def normalize_location_string(loc: str) -> str:
     """Phase 7: Normalize remote & location names."""
     if not loc:

@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import hashlib
+import time
+import logging
 from datetime import datetime
 from typing import Any
 import PyPDF2 as pdf
@@ -12,6 +15,17 @@ from utils import optimize_keywords, enforce_page_limit
 from dotenv import load_dotenv
 from streamlit import session_state as st_session
 import openai
+
+logger = logging.getLogger(__name__)
+
+# Cache for ATS scores (max 100 entries, TTL 1 hour)
+_ats_cache = {}
+_ats_cache_ttl = 3600
+
+def _get_cache_key(cv_content, job_description=""):
+    """Generate cache key from CV + JD content"""
+    content = f"{cv_content}|{job_description}"
+    return hashlib.md5(content.encode()).hexdigest()
 
 def _get_session_ai_model():
     """Safely get ai_model from Streamlit session state without warnings when running outside Streamlit."""
@@ -41,13 +55,19 @@ model = genai.GenerativeModel("gemini-2.5-flash")  # type: ignore
 # =============================================================================
 TRUTHFULNESS_GUARDRAIL = (
     "HARD RULE — TRUTHFULNESS (highest priority, overrides any other instruction below):\n"
-    "Use ONLY facts present in the candidate's résumé and in the VERIFIED EXPERIENCE block "
-    "below (if present). Do NOT invent, fabricate, exaggerate, or assume any employer, job "
-    "title, date, degree, skill, tool, certification, project, or metric that is not "
-    "explicitly supported by those sources. You MAY rephrase real experience using the job "
-    "description's terminology and surface genuinely-held skills; you may NOT add experience "
-    "the candidate does not have. If evidence for a JD requirement is missing, OMIT it rather "
-    "than invent it. Never present placeholder or example numbers as real achievements."
+    "Use facts from the candidate's résumé and VERIFIED EXPERIENCE block (if present) as your foundation.\n\n"
+    "You MAY:\n"
+    "- Reframe and rephrase existing experience to align with the job description's terminology\n"
+    "- Surface genuinely-held skills that are reasonably inferred from the candidate's demonstrated experience\n"
+    "- Emphasize relevant aspects of existing roles that match the target position\n"
+    "- Connect related skills and experiences to show applicability to the JD\n"
+    "- Highlight transferable skills that are logically supported by the candidate's background\n\n"
+    "You MUST NOT:\n"
+    "- Invent new employers, job titles, dates, degrees, or certifications\n"
+    "- Fabricate metrics, achievements, or project outcomes that aren't supported by the candidate's history\n"
+    "- Present placeholder or example numbers as real achievements\n"
+    "- Add skills or tools the candidate has never used or demonstrated\n\n"
+    "The goal is to present the candidate's authentic experience in the most compelling way for the target role — not to invent experience they don't have."
 )
 
 
@@ -199,6 +219,120 @@ class CVOptimization(BaseModel):
     optimized_content: str
     suggestions: list
 
+
+class CVOptimizationResult(BaseModel):
+    """Structured result for the closed-loop CV optimizer."""
+    optimized_content: str
+    ats_score: int | None = None
+    keyword_match: int | None = None
+    missing_keywords: list[str] = []
+    repair_passes_used: int = 0
+    fixes_applied: list[str] = []
+    unsupported_gaps: list[str] = []
+    target_ats_score: int = 100
+
+
+def _unique_preserve_order(items: list[str], limit: int | None = None) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        val = str(item or "").strip()
+        key = val.lower()
+        if not val or key in seen:
+            continue
+        seen.add(key)
+        out.append(val)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _term_present(term: str, text: str) -> bool:
+    """ATS-ish phrase check: direct phrase or all core words present."""
+    if not term or not text:
+        return False
+    term_low = term.lower().strip()
+    text_low = text.lower()
+    if term_low in text_low:
+        return True
+    words = [w for w in re.findall(r"[a-zA-Z0-9\+#\.\-/]+", term_low) if len(w) > 2]
+    generic = {"developer", "engineer", "specialist", "manager", "role", "team"}
+    core = [w for w in words if w not in generic]
+    return bool(core and all(w in text_low for w in core))
+
+
+def _context_text(extra_context: Any) -> str:
+    if not extra_context:
+        return ""
+    if isinstance(extra_context, dict):
+        return "\n".join(str(v) for v in extra_context.values() if v)
+    if isinstance(extra_context, list):
+        return "\n".join(str(v) for v in extra_context if v)
+    return str(extra_context)
+
+
+def build_jd_keyword_plan(resume_text: str, job_description: str, extra_context: Any = "") -> dict[str, list[str]]:
+    """Build a deterministic keyword plan and evidence classification for the JD."""
+    if not job_description:
+        return {
+            "supported": [],
+            "candidate_verified": [],
+            "missing_evidence": [],
+            "required_keywords": [],
+            "role_title_terms": [],
+        }
+
+    try:
+        from utils import extract_ats_phrases, extract_domain_keywords, filter_keywords
+    except Exception:
+        extract_ats_phrases = lambda text: []  # type: ignore
+        extract_domain_keywords = lambda text: []  # type: ignore
+        filter_keywords = lambda kws: kws  # type: ignore
+
+    phrases = list(extract_ats_phrases(job_description) or [])
+    phrases.extend(extract_domain_keywords(job_description) or [])
+
+    # Pull title-like terms from the first JD lines. This is intentionally narrow:
+    # role terms help header/summary alignment without polluting the skills list.
+    first_lines = " ".join(str(job_description).splitlines()[:4])
+    title_terms = filter_keywords(re.findall(r"\b[A-Za-z][A-Za-z0-9\+#\.\-]{2,}\b", first_lines.lower()))
+    phrases.extend(title_terms[:6])
+
+    terms = _unique_preserve_order([p.lower() for p in phrases], limit=35)
+    resume = resume_text or ""
+    verified = _context_text(extra_context)
+
+    supported = [t for t in terms if _term_present(t, resume)]
+    candidate_verified = [t for t in terms if t not in supported and _term_present(t, verified)]
+    missing = [t for t in terms if t not in supported and t not in candidate_verified]
+
+    required = _unique_preserve_order(supported + candidate_verified, limit=25)
+    return {
+        "supported": supported,
+        "candidate_verified": candidate_verified,
+        "missing_evidence": missing[:15],
+        "required_keywords": required,
+        "role_title_terms": _unique_preserve_order(title_terms[:6]),
+    }
+
+
+def _format_keyword_plan_for_prompt(keyword_plan: dict[str, list[str]]) -> str:
+    if not keyword_plan:
+        return ""
+    required = keyword_plan.get("required_keywords") or []
+    missing = keyword_plan.get("missing_evidence") or []
+    role_terms = keyword_plan.get("role_title_terms") or []
+    lines = [
+        "DETERMINISTIC ATS KEYWORD PLAN:",
+        "- Supported/verified JD terms to include naturally wherever truthful: "
+        + (", ".join(required) if required else "None found; rely only on resume evidence."),
+        "- Target role/title terms to surface in the header or professional summary when truthful: "
+        + (", ".join(role_terms) if role_terms else "None detected."),
+        "- JD terms with missing evidence. Do NOT claim these as experience unless the resume or verified answers support them: "
+        + (", ".join(missing) if missing else "None."),
+    ]
+    return "\n".join(lines)
+
 def standardize_cv_formatting(cv_text: str) -> str:
     """Standardize bullet symbols to '•' and clean up section headers per docs/resume_fix_prompt.md."""
     if not cv_text:
@@ -214,27 +348,52 @@ def standardize_cv_formatting(cv_text: str) -> str:
         cleaned_lines.append(line)
     return '\n'.join(cleaned_lines)
 
+def _finalize_optimized_cv(raw_cv: str, job_description: str = "") -> str:
+    """Clean, format, and standardize the generated CV content."""
+    if not raw_cv:
+        return ""
+    cleaned = clean_cv_content(raw_cv)
+    standardized = standardize_cv_formatting(cleaned)
+    enhanced = enhance_action_verbs(standardized, intensity="High")
+    return enhanced
+
 def extract_resume_text(uploaded_file):
     """Extract text from uploaded resume file"""
-    if uploaded_file.name.endswith(".pdf"):
+    if not uploaded_file:
+        return ""
+    try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    if uploaded_file.name.lower().endswith(".pdf"):
         try:
             reader = pdf.PdfReader(uploaded_file)
+            text = ""
+            for page in reader.pages:
+                text += (page.extract_text() or "") + "\n"
+            return text.strip()
         except Exception:
-            # Stream resets can help with some uploaders
-            uploaded_file.seek(0)
-            reader = pdf.PdfReader(uploaded_file)
-        text = ""
-        for page in reader.pages:
-            # PyPDF2 can return None if a page has no extractable text
-            text += (page.extract_text() or "")
-        return text.strip()
-    elif uploaded_file.name.endswith(".docx"):
-        doc = Document(uploaded_file)
-        return '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
+            try:
+                uploaded_file.seek(0)
+                reader = pdf.PdfReader(uploaded_file)
+                text = ""
+                for page in reader.pages:
+                    text += (page.extract_text() or "") + "\n"
+                return text.strip()
+            except Exception:
+                return ""
+    elif uploaded_file.name.lower().endswith(".docx"):
+        try:
+            doc = Document(uploaded_file)
+            return '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
+        except Exception:
+            return ""
     else:
         return ""
 
-def generate_cv(
+def _generate_cv_once(
     resume_text,
     job_description,
     target_match=100,
@@ -246,9 +405,11 @@ def generate_cv(
     language="English",
     model_choice="premium",
     extra_context="",
+    keyword_plan=None,
+    repair_instructions="",
     **kwargs
 ):
-    """Generate optimized CV using Gemini AI
+    """Generate one optimized CV draft using Gemini AI.
 
     NOTE:
       - `model_choice` is a string (e.g., "premium" or "premium_classic") coming
@@ -314,284 +475,82 @@ def generate_cv(
     """
     
     verified_block = build_verified_context_block(extra_context)
+    keyword_plan_block = _format_keyword_plan_for_prompt(keyword_plan or {})
+    repair_block = str(repair_instructions or "").strip()
     prompt_5 = f"""
     {language_instruction}
 
     {TRUTHFULNESS_GUARDRAIL}
 
-    You are a professional resume writer and an expert in ATS optimization and role alignment.
-
-        # --- NEW: language instruction used in prompts ---
-    language_instruction = f"Generate the entire resume and all section headers in {language}. Use native {language} formatting for dates and section names (e.g., 'Formation' for French)."
-
-    FINAL DO'S AND DON'TS
-    PART 1: ATS KEYWORD OPTIMIZATION
-    DO:
-
-    Extract ALL ATS keywords first - Before writing CV, list every keyword from JD in categories: Hard Skills/Tools, Soft Skills, Action Verbs, Role-Specific Terms, Industry Jargon, Exact Phrases
-    Use exact JD phrasing - Match spelling, hyphenation, capitalization exactly (e.g., "Adobe CC Suite" not "Adobe Creative Cloud")
-    Ensure 100% keyword coverage - Every single ATS keyword must appear at least once in CV
-    Keep multi-word phrases intact - Use "on-demand learning library" not "on-demand library" or "learning library"
-    Distribute keywords strategically - Professional Summary (40%), Key Skills (30%), Work Experience (30%)
-    Create verification checklist - After CV generation, list: ✓ Keyword | Location in CV | Frequency
-    Match acronym formats exactly - If JD uses "L&D", don't write "L and D"
-    Target 2-3% keyword density - Of total CV word count (excluding common words)
-    Repeat primary keywords 2-4 times - Across different sections in varied contexts
-
-    DON'T:
-
-    Don't use synonyms when JD uses specific terms - If JD says "stakeholders", don't substitute "clients"
-    Don't skip any JD keywords - Even if they seem minor
-    Don't modify JD phrases - Keep them verbatim for ATS matching
-
-
-    PART 2: ACTION VERB VARIETY
-    DO:
-
-    Rotate action verbs - Use each verb maximum twice across entire CV
-    Use strong, specific verbs - Designed, facilitated, spearheaded, implemented, coordinated, established, optimized, championed, executed, orchestrated
-    Vary sentence structures - Mix patterns: "Led X resulting in Y" / "Increased X by Y through Z" / "Partnered with X to achieve Y"
-    Match verb tense to timing - Current roles: present tense; Past roles: past tense
-    Choose action over passive - "Designed training programme" not "Was responsible for training design"
-
-    DON'T:
-
-    Don't repeat verbs excessively - Avoid "Delivered...Delivered...Delivered" in consecutive bullets
-    Don't use vague verbs - Avoid "supported", "assisted", "helped", "involved in"
-    Don't mix tenses within same role - Inconsistent tenses look unprofessional
-
-
-    PART 3: METRICS & QUANTIFICATION
-    DO:
-
-    Add context to metrics - Include baseline, timeframe, or scale: "Increased from 58% to 83% over 12 months"
-    Limit metrics per role - Maximum 2-3 quantified bullets per position
-    Vary impact types - Mix efficiency gains, cost savings, satisfaction scores, adoption rates, time reduction, quality improvements, reach expansion
-    Balance quantitative and qualitative - Not every bullet needs a percentage; include recognition, innovations, awards
-
-    DON'T:
-
-    Don't use percentages without context - Avoid "Increased by 40%" without explaining 40% of what
-    Don't overload with numbers - Percentage in every bullet looks fabricated
-    Don't use same metric type repeatedly - "Increased engagement by X%" shouldn't appear 5 times
-
-
-    PART 4: CONTENT STRUCTURE
-    DO:
-
-    Organize skills in categories - 3-4 thematic groups with 5-7 items each (e.g., Technical Tools | Core Competencies | Delivery Methods)
-    Weight by recency - Current-3 years: 6-7 bullets | 4-7 years: 4-5 bullets | 8-10 years: 3 bullets | 10+ years: 2 bullets max
-    Make bullets specific and actionable - Answer: What did you DO + How + What was the result?
-    Add company context for unknowns - Brief descriptor for lesser-known companies: "(EdTech SaaS, 200+ clients)"
-    Ensure chronological accuracy - Flag overlapping dates, add "(Part-time)" or "(Concurrent)" if needed
-    Show career progression - Titles should reflect upward trajectory: Specialist → Senior → Manager → Advisor
-    Include cultural fit signals - 1-2 bullets showing alignment with company values (collaboration, innovation, diversity)
-    Manage white space - Proper spacing between sections for visual breathing room
-    Use acronyms correctly - First mention: spell out with acronym; subsequent: acronym only
-
-    DON'T:
-
-    Don't create comma-separated skill lists - Avoid 60+ keywords in one paragraph
-    Don't give equal detail to old roles - Roles from 10+ years ago shouldn't match current role detail
-    Don't repeat information - Summary shouldn't echo work experience bullets
-    Don't create dense text blocks - Poor readability even with perfect content
-    Don't show lateral or regressive titles - Without explanation, looks like career stagnation
-
-
-    PART 5: PROFESSIONAL SUMMARY
-    DO:
-
-    Keep it concise - Maximum 75 words, 4 sentences
-    Focus on formula - Years of experience + key technical skills + quantifiable impact + unique value
-    Emphasize differentiation - What makes this candidate unique?
-    Target the specific role - Open with "Applying for [exact role title]"
-
-    DON'T:
-
-    Don't keyword stuff - Summary shouldn't read like SEO exercise
-    Don't create generic statements - Avoid phrases that could apply to anyone
-    Don't exceed word limit - Long summaries lose impact
-
-
-    PART 6: LANGUAGE & TONE
-    DO:
-
-    Write for humans first, ATS second - Bullets should read naturally when spoken aloud
-    Match industry terminology - Corporate L&D: "stakeholders", "business partners", "learner engagement"
-    Use specific tool proficiency - "Expert in Articulate 360 (Storyline, Rise)" not just "Articulate 360"
-    Maintain natural flow - Integrate keywords within achievement statements naturally
-    Target 60-70% keyword coverage - Not 100% saturation
-
-    DON'T:
-
-    Don't use academic jargon for corporate roles - Avoid "pedagogy", "apprentice", "lecturer" when applying to corporate L&D
-    Don't force keywords artificially - Should enhance, not disrupt, readability
-    Don't write robotically - Avoid repetitive sentence structures that sound mechanical
-
-
-    PART 7: CERTIFICATION & EDUCATION
-    DO:
-
-    Filter for relevance - Only include certifications directly applicable to target role
-    Prioritize recent and role-specific - CIPD, instructional design, coaching for L&D roles
-    List chronologically - Most recent first
-
-    DON'T:
-
-    Don't include unrelated credentials - Medical coding certification for L&D role adds clutter
-    Don't overwhelm with quantity - 5-7 relevant certifications maximum
-
-
-    PART 8: ACHIEVEMENT VS ACTIVITY
-    DO:
-
-    Maintain 70/30 ratio - 70% achievement-focused (impact/results) + 30% activity-focused (scope/responsibilities)
-    Lead with impact - Start bullets with outcome when possible
-    Show scope and scale - Number of learners, teams, programmes, locations
-
-    DON'T:
-
-    Don't list only activities - "Managed training programmes" without showing outcomes
-    Don't be vague about contributions - Specify what YOU did, not what team did
-
-
-    PART 9: GEOGRAPHIC RELEVANCE
-    DO:
-
-    Highlight target geography prominently - If applying in UK, emphasize UK/EMEA experience early
-    Position international as bonus - Global experience is context, not headline (unless role requires it)
-
-    DON'T:
-
-    Don't bury local experience - Don't let overseas roles overshadow relevant local work
-
-
-    PART 10: FINAL VERIFICATION
-    DO:
-
-    Run final ATS checklist - Confirm: "All [X] ATS keywords from JD integrated. Zero keywords skipped."
-    Read aloud test - CV should sound natural when spoken
-    Check visual hierarchy - Sections should be scannable in 10 seconds
-    Verify dates don't overlap - Unless explicitly noted as concurrent
-
-    DON'T:
-
-    Don't skip proofreading - Typos undermine credibility
-    Don't submit without keyword verification - Missing ATS keywords = automatic rejection risk
-
-
-    SUMMARY PROMPT FOR AI CV GENERATION:
-    "Create a CV that:
-
-    Extracts and integrates 100% of JD keywords exactly as written (create verification checklist)
-    Uses varied action verbs (each verb max 2x)
-    Includes contextual metrics (baseline/timeframe) in 2-3 bullets per role
-    Organizes skills in 3-4 categories with 5-7 items each
-    Weights content by recency (detailed recent, brief older roles)
-    Writes 75-word professional summary focused on differentiation
-    Maintains 70% achievement / 30% activity ratio
-    Uses natural language that reads smoothly aloud
-    Shows specific tool proficiency and role-relevant certifications
-    Includes cultural fit signals aligned with company values
-    Verifies chronological accuracy and proper white space
-    Achieves 60-70% keyword density without robotic repetition
-    Confirms every JD keyword appears at least once before finalizing"
-
-    Automated JD Keyword Embedding
-    “Extract the top 20-25 JD keywords and naturally embed them in the summary, skills, and experience sections without keyword stuffing.”
-
-    Title-Aligned Summary + Portfolio Digest
-    “Rewrite the summary (≤100 words) to:
-
-    Name the exact job title from the JD.
-
-    Weave in 3-4 JD skills.
-
-    Add a concise portfolio/publication highlight with quantifiable impact (one clause).”
-
-    Achievement-Driven JD Mirroring
-    “Transform responsibilities into action-verb, metric-led bullets (≤14 words). Mirror key JD duties (e.g., design/facilitation/logistics/evaluation for L&D or role-specific equivalents). Ensure ≥50% bullets show measurable outcomes.”
-
-    Role-Specific Principles Injection
-    “Add 1-2 bullets per relevant role that explicitly reference core domain principles from the JD (e.g., ‘adult learning principles’ for L&D; adapt to each domain).”
-
-    Collaboration & Stakeholder Evidence
-    “Insert at least one bullet per role demonstrating cross-functional collaboration using JD language (e.g., partnered with HR/ops/managers/stakeholders) and outcome.”
-
-    Portfolio Link Placement
-    “Place one short portfolio link in the header or summary only (≤100 characters description). Make it clearly labeled and clickable. Do not repeat links inside experience bullets.”
-
-    Dynamic Content Balancing
-    “When portfolio or JD keywords expand content, auto-condense elsewhere: prioritize the last 8–10 years, reduce older roles to 1–3 bullets, remove repetition, and keep total length within two sides.”
-
-    Your job is to:
-    1. Parse the candidate's resume and extract **real experience**.
-    2. Analyze the job description to extract **critical keywords, tools, titles, skills, certifications, and action verbs**.
-    3. Identify mismatches between the resume and JD (especially job titles like "Data Analyst" vs. "Data Engineer").
-    4. Reframe the resume to match the **job role in the JD**, especially:
-    - Rewrite bullet points to highlight experience adjust Real experience with the JD's Skills.
-    - Emphasize **tools, platforms, pipelines, databases, programming, and architecture** relevant to the target role.
-    - Add **measurable outcomes and business impact** wherever possible.
-    EXECUTE UNIVERSAL CV GENERATION: Analyze JD, extract 45 ATS skills, generate 100-word summary, create 26 JD-aligned roles across all companies and ensure the entire content fits within 2 A4 pages. Use only exact wording from the JD. No paraphrasing. No personal data. Avoid repetition. Ensure perfect ATS compatibility, and quantifiable outcomes in 50%+ of roles.
-    Steps:
-    Extract 45 unique ATS-compliant skills from the JD using exact wording. Limit each skill to 1-2 words. Categorize into: 15 Technical Skills, 15 Soft Skills, 15 Job-Specific Competencies.
-    Write a 100-word summary starting with “Applying for [exact job title]”. Include [X]+ years experience, 15+ ATS keywords, quantifiable outcomes, global exposure, and action verbs. No synonyms.
-    For each REAL role already in the résumé, rewrite its bullets: 10-14 words each, using 1-2
-    ATS skills, ending with a full stop. Surface quantifiable outcomes ONLY where the résumé
-    supports them. Avoid repeating skills across bullets. Do not add roles or companies that are
-    not in the résumé.
-
-    Do NOT invent or fabricate any experience. Keep every job title, employer, and date exactly
-    as in the résumé. Rephrase the candidate's REAL responsibilities using the JD's terminology
-    and surface genuinely-held skills; never add duties, skills, or achievements the résumé (or
-    the verified answers below) do not support.
-
-    Your goal is to improve this resume to achieve as high an honest ATS match as possible with
-    the JD (target **{target_match}%**), WITHOUT inventing anything.
-
-    Generate the resume in this exact plain text format with these headers (Headers in Bold), make sure name and details are in centre:
-
-    NAME
-    Phone No | Email | Address
-    Portfolio Link
-    # Make sure NAME and contact details are at the top, centered, and not under any section
+    {keyword_plan_block}
+
+    {repair_block}
+
+    You are an expert resume writer and ATS optimization specialist.
+    Your objective is to achieve a BENCHMARK ATS SCORE OF AT LEAST 85-100% against the target Job Description by reframing the candidate's real experience and incorporating all candidate-verified answers, WITHOUT inventing any unverified companies, job titles, or fake metrics.
+
+    REWRITING & ATS OPTIMIZATION DIRECTIVES:
+    1. VERIFIED ANSWERS & FOLLOW-UP Q&A INTEGRATION (CRITICAL):
+       - If a VERIFIED EXPERIENCE block is provided below, treat all candidate answers, skills, and tools in that block as candidate-verified truths.
+       - You MUST seamlessly embed EVERY skill, tool, methodology, and achievement mentioned in the VERIFIED EXPERIENCE block into the KEY SKILLS section and the relevant bullet points under WORK EXPERIENCE or PROJECTS.
+       - These verified answers were provided specifically to resolve ATS gaps identified for this Job Description. Failing to include them will cause the resume to fail ATS cutoff screening.
+
+    2. EXACT TERMINOLOGY & KEYWORD ALIGNMENT:
+       - Identify every hard technical skill, platform, framework, library, tool, database, architecture pattern, and methodology mentioned in the Job Description.
+       - Use exact terminology and spelling from the Job Description across the resume only when supported by the résumé or VERIFIED EXPERIENCE block.
+       - Maintain both full terms and standard acronyms (e.g. "Continuous Integration/Continuous Deployment (CI/CD)").
+
+    3. PROFESSIONAL SUMMARY:
+       - Open directly with a strong target profile headline referencing the exact role title from the Job Description (e.g. "[Exact Target Role Title] with X+ years of experience in...").
+       - Weave the top 4-6 critical technical keywords and domain skills from the JD into this 3-4 sentence paragraph.
+
+    4. KEY SKILLS SECTION:
+       - Create bulleted categories: Technical Skills, Tools & Platforms, Methodologies & Core Competencies.
+       - Ensure every hard skill and tool from the JD that the candidate possesses or verified in follow-up answers is explicitly listed here.
+
+    5. WORK EXPERIENCE & PROJECTS:
+       - {intensity_mapping.get(action_verb_intensity, intensity_mapping["High"])}
+       - {matching_mapping.get(keyword_matching, matching_mapping["Balanced"])}
+       - Keep original company names, job titles, and employment dates intact.
+       - Rewrite bullet points to start with strong, high-impact action verbs (e.g., Spearheaded, Architected, Engineered, Optimized, Implemented).
+       - In every bullet point, explicitly reference the tools, technologies, and exact JD keywords used, and highlight quantifiable outcomes (%, numbers, performance gains).
+       - Each bullet must tell a mini-story: challenge → action → result (e.g., "Identified bottleneck in data pipeline, engineered Spark-based solution, reduced processing time by 60%").
+       - Integrate keywords naturally into achievement sentences — don't just list them. Write as if describing real accomplishments to a hiring manager.
+       - Vary sentence openings and structure to avoid repetitive patterns that ATS parsers may flag as keyword stuffing.
+       - Include context: don't just say "Used Python for automation" — say "Developed Python-based ETL pipeline that reduced data processing time by 40% and eliminated manual errors".
+
+    6. CLEAN ATS FORMATTING:
+       - Use standard, uppercase section headers EXACTLY as: PROFESSIONAL SUMMARY, KEY SKILLS, WORK EXPERIENCE, EDUCATION, PROJECTS, CERTIFICATIONS.
+       - Output only standard bullet points ('• '). Do not add markdown code fences, commentary, or tags.
+
+    OUTPUT FORMAT TEMPLATE:
+
+    [CANDIDATE FULL NAME]
+    [Phone Number] | [Email Address] | [Location / Address]
+    [LinkedIn / Portfolio Link]
 
     PROFESSIONAL SUMMARY:
-    
+    [Professional summary paragraph matching target role keywords]
 
     KEY SKILLS:
-    Skill 1, Skill 2.....
+    • Technical Skills: [Skill 1, Skill 2, Skill 3...]
+    • Tools & Platforms: [Tool 1, Tool 2, Tool 3...]
+    • Core Competencies: [Competency 1, Competency 2...]
 
     WORK EXPERIENCE:
-    [Company Name] | [Original Job Title] | [MM/YYYY - MM/YYYY]
-    All original companies included, reverse chronological.  
-    **Do NOT invent new companies.**
-
-    **Bullet Distribution Rules (use ONLY the candidate's real experience):**
-        • Weight bullets toward the most recent and most JD-relevant roles.
-        • Every bullet must be grounded in the résumé (or the verified answers) — rephrase real
-          duties in JD language; do NOT add bullets for experience that is not supported.
-        • Total bullets = 26 max.
-
-    **Each bullet:**
-    • 10-14 words
-    • Include quantifiable metrics ONLY where the résumé/verified answers actually provide them —
-      never invent numbers.
-    • End with a period.
+    [Company Name] | [Job Title] | [MM/YYYY - MM/YYYY]
+    • [Action verb] [Responsibility/Achievement rephrased with JD keywords]...
+    • [Action verb] [Responsibility/Achievement rephrased with JD keywords]...
 
     EDUCATION:
-    • Degree | Institution | Year(keep the dates in the same format as given in resume)
+    • [Degree] | [Institution] | [Graduation Year]
 
-    PROJECTS:(if any)
-    Project Name 1
-    • Bullet 1
-    • Bullet 2
-    
-    Project Name 2
-    • Bullet 1
-    • Bullet 2
+    PROJECTS:
+    [Project Title]
+    • [Bullet point detailing scope, technologies used, and outcomes]
 
-    CERTIFICATIONS:(If any)
+    CERTIFICATIONS:
+    • [Certification Name] - [Issuing Organization] ([Year])
 
     Resume Content:
     {resume_text}
@@ -601,13 +560,17 @@ def generate_cv(
     Job Description:
     {job_description}
 
-    IMPORTANT: Output ONLY the final resume content. Do NOT include any analysis, metadata, explanations, extraction lists, counts, or notes such as "ATS Skill Extraction", "Technical Skills:", or "(Resume is within 2 pages...)". Return plain resume only.
+    IMPORTANT: Output ONLY the final ATS-optimized resume. Do NOT include any analysis, markdown code blocks, comments, or notes.
     """
 
     
     try:
+        start_time = time.time()
+        model_choice = _get_session_ai_model() or "gemini"
+        logger.info(f"Starting CV generation: model={model_choice}, prompt_length={len(prompt_5)}")
+        
         # ✅ OpenAI Flow
-        if _get_session_ai_model() == "openai":
+        if model_choice == "openai":
             response = openai.chat.completions.create(
                 model="gpt-4.1",
                 messages=[
@@ -617,6 +580,9 @@ def generate_cv(
                 temperature=0.2
             )
             raw_cv = response.choices[0].message.content or ""
+            logger.info(f"OpenAI response: tokens={response.usage.total_tokens if response.usage else 'unknown'}")
+            elapsed = time.time() - start_time
+            logger.info(f"CV generation completed in {elapsed:.2f}s")
             return _finalize_optimized_cv(raw_cv, job_description)
 
         # ✅ Gemini Flow
@@ -643,10 +609,209 @@ def generate_cv(
         if not raw_cv:
             raise Exception("AI response was empty")
 
+        elapsed = time.time() - start_time
+        logger.info(f"CV generation completed in {elapsed:.2f}s")
         return _finalize_optimized_cv(raw_cv, job_description)
         
     except Exception as e:
+        logger.exception(f"CV generation failed: {e}")
         raise Exception(f"Failed to generate CV: {str(e)}")
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(float(str(value).strip().rstrip("%")))
+    except Exception:
+        return None
+
+
+def _measure_cv_against_jd(cv_content: str, job_description: str) -> dict[str, Any]:
+    """Return measured ATS data, preferring AI analysis when it succeeds."""
+    local = optimize_keywords(cv_content, job_description)
+    ai = None
+    try:
+        ai = analyze_cv_ats_score(cv_content, job_description)
+    except Exception:
+        ai = None
+
+    ai_score = _to_int_or_none((ai or {}).get("score"))
+    ai_kw = _to_int_or_none((ai or {}).get("keyword_match"))
+    local_score = _to_int_or_none(local.get("score")) or 0
+    local_kw = _to_int_or_none(local.get("keyword_match")) or 0
+
+    score = ai_score if ai_score is not None else local_score
+    keyword_match = ai_kw if ai_kw is not None else local_kw
+
+    missing = _unique_preserve_order(
+        [str(k) for k in ((local.get("missing_keywords") or []) + ((ai or {}).get("missing_keywords") or []))],
+        limit=12,
+    )
+    suggestions = _unique_preserve_order(
+        [str(s) for s in ((local.get("suggestions") or []) + ((ai or {}).get("suggestions") or []))],
+        limit=10,
+    )
+    return {
+        "score": score,
+        "keyword_match": keyword_match,
+        "missing_keywords": missing,
+        "suggestions": suggestions,
+        "local": local,
+        "ai": ai or {},
+    }
+
+
+def _build_repair_instructions(
+    cv_content: str,
+    job_description: str,
+    keyword_plan: dict[str, list[str]],
+    measurement: dict[str, Any],
+    pass_number: int,
+) -> tuple[str, list[str]]:
+    quality = validate_cv_quality(cv_content, job_description)
+    missing = measurement.get("missing_keywords") or []
+    unsupported = keyword_plan.get("missing_evidence") or []
+    actionable_missing = [
+        kw for kw in missing
+        if kw not in unsupported and (
+            _term_present(kw, " ".join(keyword_plan.get("required_keywords") or []))
+            or _term_present(kw, cv_content)
+        )
+    ]
+
+    fixes = []
+    lines = [
+        f"TARGETED ATS REPAIR PASS {pass_number}:",
+        "Revise the resume below, preserving truthful facts and all original employers, job titles, dates, degrees, and contact details.",
+    ]
+    if actionable_missing:
+        fixes.append("Added supported JD keywords missing from generated CV")
+        lines.append(
+            "Naturally add these supported or candidate-verified JD terms where they fit the summary, KEY SKILLS, WORK EXPERIENCE, or PROJECTS: "
+            + ", ".join(_unique_preserve_order(actionable_missing, limit=10))
+        )
+    if measurement.get("keyword_match") is not None and int(measurement.get("keyword_match") or 0) < 90:
+        fixes.append("Improved measured keyword match")
+        lines.append("Increase exact JD terminology coverage without keyword stuffing.")
+    if measurement.get("score") is not None and int(measurement.get("score") or 0) < 85:
+        fixes.append("Improved measured ATS score")
+        lines.append("Strengthen ATS score by improving relevance, quantification, structure, and supported keyword placement.")
+    if quality.get("issues"):
+        fixes.append("Fixed quality gate issues")
+        lines.append("Fix these quality issues: " + "; ".join(str(i) for i in quality.get("issues", [])[:6]))
+    lines.append(
+        "If a JD term has missing evidence, do not claim it as experience. Leave it out or phrase it only as an honest transferable-adjacent strength supported by the resume."
+    )
+    lines.append("\nCURRENT GENERATED RESUME TO REPAIR:\n" + cv_content)
+    return "\n".join(lines), _unique_preserve_order(fixes)
+
+
+def _needs_repair(cv_content: str, job_description: str, measurement: dict[str, Any]) -> bool:
+    quality = validate_cv_quality(cv_content, job_description)
+    score = _to_int_or_none(measurement.get("score")) or 0
+    keyword_match = _to_int_or_none(measurement.get("keyword_match")) or 0
+    return (
+        quality.get("should_regenerate", False)
+        or score < 85
+        or keyword_match < 90
+        or bool(measurement.get("missing_keywords"))
+    )
+
+
+def generate_cv(
+    resume_text,
+    job_description,
+    target_match=100,
+    template="professional",
+    sections=None,
+    quantitative_focus=60,
+    action_verb_intensity="High",
+    keyword_matching="Balanced",
+    language="English",
+    model_choice="premium",
+    extra_context="",
+    optimization_depth: str = "max_ats",
+    return_metadata: bool = False,
+    **kwargs
+):
+    """Generate a CV through a measured Max ATS optimization loop.
+
+    Backward compatible: returns plain text unless `return_metadata=True`.
+    """
+    target_score = int(target_match or 100)
+    keyword_plan = build_jd_keyword_plan(resume_text, job_description, extra_context)
+    max_repairs = 2 if str(optimization_depth or "max_ats").lower() in {"max_ats", "max", "maximum"} else 1
+
+    cv_content = _generate_cv_once(
+        resume_text=resume_text,
+        job_description=job_description,
+        target_match=target_score,
+        template=template,
+        sections=sections,
+        quantitative_focus=quantitative_focus,
+        action_verb_intensity=action_verb_intensity,
+        keyword_matching=keyword_matching,
+        language=language,
+        model_choice=model_choice,
+        extra_context=extra_context,
+        keyword_plan=keyword_plan,
+        **kwargs,
+    )
+
+    fixes_applied: list[str] = []
+    repair_passes = 0
+    measurement = _measure_cv_against_jd(cv_content, job_description)
+
+    for pass_number in range(1, max_repairs + 1):
+        if not _needs_repair(cv_content, job_description, measurement):
+            break
+        repair_instructions, fixes = _build_repair_instructions(
+            cv_content=cv_content,
+            job_description=job_description,
+            keyword_plan=keyword_plan,
+            measurement=measurement,
+            pass_number=pass_number,
+        )
+        if not fixes and pass_number > 1:
+            break
+        cv_content = _generate_cv_once(
+            resume_text=resume_text,
+            job_description=job_description,
+            target_match=target_score,
+            template=template,
+            sections=sections,
+            quantitative_focus=quantitative_focus,
+            action_verb_intensity=action_verb_intensity,
+            keyword_matching="Aggressive",
+            language=language,
+            model_choice=model_choice,
+            extra_context=extra_context,
+            keyword_plan=keyword_plan,
+            repair_instructions=repair_instructions,
+            **kwargs,
+        )
+        repair_passes = pass_number
+        fixes_applied.extend(fixes)
+        measurement = _measure_cv_against_jd(cv_content, job_description)
+
+    result = CVOptimizationResult(
+        optimized_content=cv_content,
+        ats_score=_to_int_or_none(measurement.get("score")),
+        keyword_match=_to_int_or_none(measurement.get("keyword_match")),
+        missing_keywords=measurement.get("missing_keywords") or [],
+        repair_passes_used=repair_passes,
+        fixes_applied=_unique_preserve_order(fixes_applied),
+        unsupported_gaps=keyword_plan.get("missing_evidence") or [],
+        target_ats_score=target_score,
+    )
+
+    if return_metadata:
+        return result.model_dump() if hasattr(result, "model_dump") else result.dict()
+    return result.optimized_content
+
 
 def generate_cover_letter(resume_text, job_description, language="English", extra_context=""):
     """Generate cover letter using Gemini AI"""
@@ -795,66 +960,102 @@ def generate_cover_letter(resume_text, job_description, language="English", extr
         raise Exception(f"Failed to generate cover letter: {str(e)}")
 
 def clean_cv_content(content):
-    """Clean and format CV content"""
+    """Clean and format CV content for standard ATS parsing"""
     if not content:
         return "Error: No content received from AI"
     
-    # Remove markdown formatting
-    content = re.sub(r'\*\*', '', content)
+    # Strip markdown backticks if AI wrapped the entire response
+    content = re.sub(r'^```[a-zA-Z]*\n', '', content)
+    content = re.sub(r'\n```$', '', content)
+
+    # Remove prompt comment leaks (e.g. # Make sure NAME...)
+    content = re.sub(r'^\s*#.*$', '', content, flags=re.MULTILINE)
+
+    # Strip parenthetical suffixes from section headers (e.g. PROJECTS:(if any) -> PROJECTS:)
+    content = re.sub(r'^([A-Z\s]+):\s*\([^)]*\)', r'\1:', content, flags=re.MULTILINE)
+
+    # Remove markdown bold/italic decorators inside text body for clean text parsing
+    content = re.sub(r'\*{1,2}', '', content)
     content = re.sub(r'__', '', content)
     
-    # Remove excessive whitespace
+    # Remove excessive blank lines
     content = re.sub(r'\n{3,}', '\n\n', content)
     
-    # Remove any hidden markers
+    # Remove hidden HTML comment markers
     content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
 
-    # Remove unwanted separators like ---
+    # Remove unwanted markdown horizontal rule separators
     content = re.sub(r'^\s*---\s*$', '', content, flags=re.MULTILINE)
     
-    # Ensure proper section formatting
+    # Ensure proper section header spacing
     content = re.sub(r'^([A-Z][A-Z\s]+):', r'\n\1:', content, flags=re.MULTILINE)
 
-    # --- Bold the first two non-empty lines (usually NAME and contact line) ---
+    # Ensure clean spacing around bullets
     lines = content.splitlines()
-    bolded_count = 0
-    for i, ln in enumerate(lines):
-        if ln.strip() == "":
-            continue
-        # If already bolded, skip counting but don't double-bold
-        if re.match(r'^\*{2}.*\*{2}$', ln.strip()):
-            bolded_count += 1
-            if bolded_count >= 2:
-                break
-            continue
-        # Wrap with markdown bold for the first two non-empty lines
-        if bolded_count < 2:
-            lines[i] = f"**{ln}**"
-            bolded_count += 1
-            if bolded_count >= 2:
-                break
-    content = "\n".join(lines)
-    
-    return content.strip()
+    cleaned_lines = []
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped:
+            cleaned_lines.append(ln)
+        elif cleaned_lines and cleaned_lines[-1] != "":
+            cleaned_lines.append("")
 
-def analyze_cv_ats_score(cv_content, job_description):
-    """Analyze CV ATS compatibility score using Gemini AI"""
+    return "\n".join(cleaned_lines).strip()
+
+def analyze_cv_ats_score(cv_content, job_description=""):
+    """Analyze CV ATS compatibility score using Gemini AI with caching.
     
-    prompt = f"""
-    You are an ATS analysis expert.
+    If job_description is provided, performs a target JD match analysis.
+    If job_description is empty or missing, performs a baseline ATS structural and formatting check.
+    """
+    has_jd = bool(job_description and str(job_description).strip())
     
-    Analyze the CV against the job description and provide:
-    1. ATS compatibility score (0-100)
-    2. Keyword match percentage
-    3. Missing critical keywords
-    4. Specific improvement suggestions
+    # Check cache first
+    cache_key = _get_cache_key(cv_content, job_description)
+    if cache_key in _ats_cache:
+        entry = _ats_cache[cache_key]
+        if time.time() - entry["timestamp"] < _ats_cache_ttl:
+            return entry["result"]
     
-    Return JSON format:
+    if has_jd:
+        prompt = f"""
+    You are an ATS analysis expert. Score the CV against the job description using this exact weighted rubric:
+    
+    **SCORING RUBRIC (Total: 100 points)**
+    
+    1. KEYWORD PRESENCE (30 points):
+       - Are the top 10-15 critical JD keywords explicitly present in the CV?
+       - Are both full terms and acronyms included (e.g., "Continuous Integration/Continuous Deployment (CI/CD)")?
+       - Deduct points for missing critical hard skills.
+    
+    2. EXPERIENCE RELEVANCE (25 points):
+       - Do work experience bullet points demonstrate the skills required by the JD?
+       - Are achievements relevant to the target role?
+       - Are there specific, measurable outcomes (%, numbers, performance gains)?
+    
+    3. QUANTIFICATION (15 points):
+       - Are there specific numbers, percentages, or metrics?
+       - Are achievements measurable (e.g., "reduced processing time by 40%", "managed $2M budget")?
+       - Deduct points for generic claims without evidence.
+    
+    4. FORMAT COMPLIANCE (15 points):
+       - Standard section headers (PROFESSIONAL SUMMARY, KEY SKILLS, WORK EXPERIENCE, EDUCATION)?
+       - ATS-parseable bullet points ('• ' format)?
+       - Clean contact information structure?
+       - No markdown, code fences, or non-ATS elements?
+    
+    5. PROFESSIONAL NARRATIVE (15 points):
+       - Is the content readable and coherent?
+       - Does it tell a compelling career story?
+       - Are there varied sentence structures (not repetitive keyword stuffing)?
+       - Does it sound authentic (like a real person describing accomplishments)?
+    
+    Calculate the total score and return:
     {{
-        "ats_score": number,
-        "keyword_match": number,
-        "missing_keywords": [list],
-        "suggestions": [list]
+        "ats_score": total_score,
+        "keyword_match": percentage_ofJD_keywords_found_in_CV,
+        "missing_keywords": [list of critical missing keywords],
+        "suggestions": [list of specific actionable suggestions based on rubric gaps]
     }}
     
     CV Content:
@@ -862,6 +1063,49 @@ def analyze_cv_ats_score(cv_content, job_description):
     
     Job Description:
     {job_description}
+    """
+    else:
+        prompt = f"""
+    You are an ATS analysis expert. No specific job description was provided.
+    Score the CV using this baseline structural rubric:
+    
+    **SCORING RUBRIC (Total: 100 points)**
+    
+    1. STRUCTURAL COMPLETENESS (30 points):
+       - Has all standard sections: PROFESSIONAL SUMMARY, KEY SKILLS, WORK EXPERIENCE, EDUCATION?
+       - Contact information present (name, phone, email, location)?
+       - Optional sections present (PROJECTS, CERTIFICATIONS)?
+    
+    2. KEYWORD ORGANIZATION (25 points):
+       - KEY SKILLS section lists technical skills, tools, and competencies clearly?
+       - Skills are categorized logically (Technical Skills, Tools & Platforms, Core Competencies)?
+       - Industry-relevant keywords are present?
+    
+    3. EXPERIENCE QUALITY (20 points):
+       - Work experience uses strong action verbs?
+       - Achievements are quantified with specific metrics?
+       - Bullet points follow ATS-compatible format ('• ' prefix)?
+    
+    4. ATS PARSEABILITY (15 points):
+       - Clean formatting without markdown, tables, or graphics?
+       - Consistent section headers in uppercase?
+       - Proper spacing and line breaks?
+    
+    5. PROFESSIONAL IMPACT (10 points):
+       - Professional summary is concise and compelling?
+       - Content flows logically from summary → skills → experience → education?
+       - Overall impression is professional and well-organized?
+    
+    Calculate the total score and return:
+    {{
+        "ats_score": total_score,
+        "keyword_match": overall_keyword_structural_match_percentage,
+        "missing_keywords": [list of missing standard sections or essential skills],
+        "suggestions": [list of specific actionable suggestions based on rubric gaps]
+    }}
+    
+    CV Content:
+    {cv_content}
     """
     
     try:
@@ -889,23 +1133,36 @@ def analyze_cv_ats_score(cv_content, job_description):
             )
             raw_text = response.text.strip()
 
+        # Clean markdown code blocks if present
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```[a-zA-Z]*\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text).strip()
+
         # ✅ Parse JSON
         try:
             parsed = json.loads(raw_text)
         except Exception as parse_err:
             raise Exception(f"Invalid JSON response: {raw_text}")
 
-        return {
+        result = {
             "score": parsed.get("ats_score", 0),
             "keyword_match": parsed.get("keyword_match", 0),
             "missing_keywords": parsed.get("missing_keywords", []),
             "suggestions": parsed.get("suggestions", [])
         }
+        
+        # Cache result
+        _ats_cache[cache_key] = {
+            "result": result,
+            "timestamp": time.time()
+        }
+        
+        return result
 
     except Exception as e:
         return {
-            "score": 0,
-            "keyword_match": 0,
+            "score": None,
+            "keyword_match": None,
             "missing_keywords": [],
             "suggestions": [f"Error analyzing CV: {str(e)}"]
         }
@@ -924,26 +1181,57 @@ def extract_key_metrics(cv_content):
     }
 
 def enhance_action_verbs(content, intensity="High"):
-    """Enhance action verbs in CV content"""
+    """Enhance action verbs in CV content with context-aware replacement"""
     
-    action_verbs = {
-        "Moderate": [
-            "managed", "developed", "created", "implemented", "led", "coordinated",
-            "designed", "analyzed", "improved", "organized", "planned", "supervised"
-        ],
-        "High": [
-            "spearheaded", "orchestrated", "revolutionized", "transformed", "pioneered",
-            "architected", "optimized", "streamlined", "accelerated", "amplified"
-        ],
-        "Very High": [
-            "catapulted", "revolutionized", "masterminded", "propelled", "dominated",
-            "commanded", "conquered", "devastated", "obliterated", "annihilated"
-        ]
+    # Weak verb patterns (multi-word included)
+    weak_patterns = {
+        "worked on": "developed",
+        "did": "executed",
+        "made": "created",
+        "helped": "collaborated on",
+        "was responsible for": "managed",
+        "handled": "oversaw",
+        "participated in": "contributed to",
+        "assisted with": "supported",
+        "took part in": "engaged in",
+        "was in charge of": "directed",
+        "used": "utilized",
+        "improved": "optimized",
     }
     
-    # This would be implemented with more sophisticated text processing
-    # For now, return the content as-is
-    return content
+    # Professional replacements by intensity
+    intensity_map = {
+        "Moderate": {
+            "developed": "developed",
+            "created": "created",
+            "managed": "managed",
+            "improved": "enhanced",
+        },
+        "High": {
+            "developed": "engineered",
+            "created": "architected",
+            "managed": "spearheaded",
+            "improved": "optimized",
+        },
+        "Very High": {
+            "developed": "pioneered",
+            "created": "revolutionized",
+            "managed": "orchestrated",
+            "improved": "transformed",
+        }
+    }
+    
+    enhanced = content
+    for weak, replacement in weak_patterns.items():
+        # Case-insensitive replacement
+        enhanced = re.sub(
+            r'\b' + re.escape(weak) + r'\b',
+            replacement,
+            enhanced,
+            flags=re.IGNORECASE
+        )
+    
+    return enhanced
 
 def generate_interview_qa(resume_text, job_description, extra_context: Any = ""):
     """Generate interview Q&A using Gemini AI"""
@@ -1298,5 +1586,103 @@ def recommend_jobs_from_resume_ai(resume_text: str, language: str = "English"):
         # Re-raise so app.py can catch it and show a proper error
         raise Exception(f"Job recommendation failed: {str(e)}")
 
+def validate_cv_quality(cv_content: str, job_description: str = "") -> dict:
+    """Validate CV quality before display. Returns dict with validation results."""
+    from utils import extract_ats_phrases, validate_cv_format
+    
+    results = {
+        "is_valid": True,
+        "issues": [],
+        "should_regenerate": False
+    }
+    
+    if not cv_content or not cv_content.strip():
+        results["is_valid"] = False
+        results["issues"].append("CV content is empty")
+        results["should_regenerate"] = True
+        return results
+    
+    cv_lower = cv_content.lower()
+    
+    # Check 1: Required sections present
+    required_sections = ["professional summary", "key skills", "work experience", "education"]
+    missing_sections = []
+    for section in required_sections:
+        if section not in cv_lower:
+            missing_sections.append(section.upper())
+    
+    if missing_sections:
+        results["is_valid"] = False
+        results["issues"].append(f"Missing required sections: {', '.join(missing_sections)}")
+        results["should_regenerate"] = True
+    
+    # Check 2: KEY SKILLS section has sufficient keywords
+    if job_description:
+        jd_phrases = extract_ats_phrases(job_description)
+        
+        # Find KEY SKILLS section
+        key_skills_match = re.search(r'key skills:?\s*\n(.*?)(?=\n[A-Z]+:|\n*$)', cv_content, re.IGNORECASE | re.DOTALL)
+        if key_skills_match:
+            key_skills_content = key_skills_match.group(1).lower()
+            keywords_found = sum(1 for phrase in jd_phrases if phrase.lower() in key_skills_content)
+            keyword_minimum = min(10, max(3, len(jd_phrases)))
+            
+            if keywords_found < keyword_minimum:
+                results["issues"].append(f"KEY SKILLS section has only {keywords_found} JD keywords (minimum: {keyword_minimum})")
+                # Don't force regeneration for this - just warn
+        else:
+            results["issues"].append("Could not find KEY SKILLS section content")
+    
+    # Check 3: Professional summary length
+    summary_match = re.search(r'professional summary:?\s*\n(.*?)(?=\n[A-Z]+:|\n*$)', cv_content, re.IGNORECASE | re.DOTALL)
+    if summary_match:
+        summary_content = summary_match.group(1).strip()
+        word_count = len(summary_content.split())
+        
+        if word_count > 100:
+            results["issues"].append(f"Professional summary is {word_count} words (recommended: under 100)")
+            # Don't force regeneration - just warn
+    
+    # Check 4: Basic format validation
+    format_validation = validate_cv_format(cv_content)
+    if not format_validation.get("valid", False):
+        results["issues"].append(f"Format issues: {format_validation.get('issues', [])}")
 
+    # Check 5: ATS-clean output only
+    if "```" in cv_content or re.search(r"^\s*#{1,6}\s+", cv_content, re.MULTILINE):
+        results["is_valid"] = False
+        results["issues"].append("Markdown/code-fence formatting detected")
+        results["should_regenerate"] = True
 
+    # Check 6: Bullet structure and repetition
+    bullet_lines = [line.strip() for line in cv_content.splitlines() if line.strip().startswith("•")]
+    if len(bullet_lines) < 6:
+        results["is_valid"] = False
+        results["issues"].append(f"Only {len(bullet_lines)} ATS bullet points found (minimum: 6)")
+        results["should_regenerate"] = True
+    normalized_bullets = [re.sub(r"\s+", " ", b.lower()) for b in bullet_lines]
+    duplicate_count = len(normalized_bullets) - len(set(normalized_bullets))
+    if duplicate_count:
+        results["issues"].append(f"{duplicate_count} repeated bullet point(s) detected")
+
+    # Check 7: simple keyword stuffing detection
+    words = re.findall(r"\b[a-zA-Z][a-zA-Z0-9\+#\.\-]{2,}\b", cv_lower)
+    if words:
+        total = len(words)
+        counts = {}
+        for word in words:
+            if word in {"and", "the", "with", "for", "from", "that", "this"}:
+                continue
+            counts[word] = counts.get(word, 0) + 1
+        overused = [w for w, c in counts.items() if c >= 10 and (c / total) > 0.035]
+        if overused:
+            results["issues"].append("Possible keyword stuffing: " + ", ".join(overused[:5]))
+    
+    # Check 8: Minimum content length
+    non_empty_lines = [line for line in cv_content.split('\n') if line.strip()]
+    if len(non_empty_lines) < 20:
+        results["is_valid"] = False
+        results["issues"].append(f"CV has only {len(non_empty_lines)} non-empty lines (minimum: 20)")
+        results["should_regenerate"] = True
+    
+    return results

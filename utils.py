@@ -179,84 +179,306 @@ def get_gemini_response(prompt: str, model: str = "gemini-2.5-flash") -> str:
 # ---------------------------
 
 def filter_keywords(keywords):
-    """Remove generic and stop words from keyword list"""
+    """Remove generic and stop words from keyword list.
+    
+    Kept words (removed from stop list) are real ATS keywords that ATS systems
+    search for: 'team', 'communication', 'strong', 'demonstrated', 'proven',
+    'track', 'record', 'preferred'.
+    """
     stop_words = {
         "the", "and", "is", "in", "of", "for", "to", "with", "on", "at", "by", "an", "be",
         "from", "that", "this", "it", "as", "are", "or", "have", "has", "was", "were", "will",
-        "a", "i", "you", "your", "we", "our", "can", "able", "achieve", "achieved", "aptitude",
-        "attitude", "dynamic", "motivated", "strong", "great", "success", "successful", "capable",
-        "good", "proficient", "hardworking", "dedicated", "excellent", "team", "communication", "passion"
+        "a", "i", "you", "your", "we", "our", "can", "able", "aptitude",
+        "dynamic", "motivated", "great", "capable",
+        "good", "proficient", "hardworking", "dedicated", "excellent",
+        "role", "work", "job", "candidate", "company", "business", "support", "help",
+        "looking", "requirement", "requirements", "required", "knowledge",
+        "qualification", "qualifications", "duties", "environment", "ability", "working",
+        "seeking", "description", "location", "full-time", "part-time", "contract", "salary", "apply",
+        "please", "send", "cv", "resume", "years", "year", "must", "should", "join", "grow",
+        "etc", "using", "uses", "used",
+        "ideal", "position", "opportunity", "well", "plus",
     }
-    return [kw for kw in keywords if kw not in stop_words and len(kw) > 2]
+    return [kw for kw in keywords if kw.lower() not in stop_words and len(kw) > 2]
+
+def extract_ats_phrases(text: str) -> List[str]:
+    """Extract technical acronyms, multi-word skills, and recognized technology terms from text.
+
+    Unlike a naive token extractor, this function only returns terms that are
+    real ATS-relevant keywords: recognized technologies, domain-specific
+    multi-word phrases, and technical acronyms. Generic single words are
+    excluded unless they match known skill patterns.
+    """
+    if not text:
+        return []
+
+    phrases = []
+    non_tech = {
+        "hands-on", "handson", "full-time", "part-time", "end-to-end", "day-to-day",
+        "cross-functional", "well-known", "self-starter", "fast-paced", "out-of-the-box"
+    }
+
+    # --- 1. Recognized technology skills (from search_engine/skills.py patterns) ---
+    try:
+        from search_engine.skills import extract_skills
+        tech_skills = extract_skills(text)
+        phrases.extend([s.lower() for s in tech_skills])
+    except ImportError:
+        pass
+
+    # --- 2. Tech acronyms and hyphenated/slashed terms (CI/CD, A/B, PySpark, Node.js) ---
+    tech_patterns = re.findall(r'\b[A-Za-z0-9]+[/\-\.][A-Za-z0-9/\-\.]+\b', text)
+    phrases.extend([p.lower() for p in tech_patterns if len(p) >= 2 and p.lower() not in non_tech])
+
+    # --- 3. Capitalized multi-word phrases (Machine Learning, Cloud Infrastructure) ---
+    cap_phrases = re.findall(r'\b[A-Z][a-z]+(?:[^\S\r\n]+[A-Z][a-z]+)+\b', text)
+    phrases.extend([p.lower() for p in cap_phrases if p.lower() not in non_tech])
+
+    # --- 4. Curated domain bigrams & trigrams ---
+    text_low = text.lower()
+    domain_phrases = [
+        "machine learning", "deep learning", "data science", "data engineering",
+        "data pipeline", "data analytics", "data warehouse", "data infrastructure",
+        "cloud computing", "cloud infrastructure", "cloud native",
+        "micro services", "microservices", "distributed systems",
+        "version control", "code review", "unit test", "integration test",
+        "test driven", "agile methodology", "scrum master",
+        "rest api", "restful api", "graphql api",
+        "natural language", "computer vision", "speech recognition",
+        "continuous integration", "continuous deployment", "continuous delivery",
+        "infrastructure as code", "monitoring and observability",
+        "object oriented", "functional programming",
+        "technical debt", "design patterns", "system design",
+        "user experience", "user interface", "responsive design",
+        "project management", "stakeholder management", "team leadership",
+        "problem solving", "analytical skills", "communication skills",
+    ]
+    for phrase in domain_phrases:
+        if phrase in text_low:
+            phrases.append(phrase)
+
+    # --- 5. Deduplicate while preserving lowercased uniqueness ---
+    seen = set()
+    unique_phrases = []
+    for item in phrases:
+        item_clean = item.strip().lower()
+        if item_clean and item_clean not in seen and item_clean not in non_tech and len(item_clean) >= 2:
+            seen.add(item_clean)
+            unique_phrases.append(item_clean)
+
+    return unique_phrases
+
+
+def _extract_jd_title(jd_text: str) -> str:
+    """Extract the job title from a job description.
+
+    Most JDs have the title as the first non-empty line, or embedded in
+    common patterns like "Job Title: ..." or "We're looking for a ...".
+    Returns the extracted title string, or empty string if not found.
+    """
+    if not jd_text:
+        return ""
+
+    lines = [ln.strip() for ln in jd_text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    # Pattern 1: Explicit "Job Title:" / "Position:" / "Title:" labels
+    label_match = re.search(
+        r'(?i)^(?:job\s+title|position|role)\s*[:\-]\s*(.{3,80})',
+        lines[0]
+    )
+    if label_match:
+        return label_match.group(1).strip()
+
+    # Pattern 2: "We're looking for a [Title]" / "Hiring a [Title]"
+    looking_match = re.search(
+        r'(?i)(?:we(?:\'re| are)?\s+(?:looking|seeking|hiring)\s+(?:for|a|an)\s+|hiring\s+a[n]?\s+)(.{3,80})',
+        lines[0]
+    )
+    if looking_match:
+        title_candidate = looking_match.group(1).strip()
+        # Trim trailing sentence words that aren't part of a title
+        trim_words = {"to", "who", "with", "in", "at", "for", "and", "or", "the", "a", "an",
+                       "join", "our", "we", "you", "your", "their", "this", "that"}
+        words = title_candidate.split()
+        trimmed = []
+        for w in words:
+            w_clean = w.rstrip(".,:;!?")
+            if w_clean.lower() in trim_words and trimmed:
+                break
+            trimmed.append(w_clean)
+        return " ".join(trimmed).rstrip(".,:;") if trimmed else title_candidate.rstrip(".,:;")
+
+    # Pattern 3: First line is likely the title if it's short and title-like
+    first_line = lines[0]
+    # Title-like: 2-8 words, mostly alphabetic, no sentence verbs
+    words = first_line.split()
+    sentence_indicators = {"we", "our", "the", "is", "are", "will", "you", "your", "this", "that", "who", "how"}
+    if 2 <= len(words) <= 8 and len(first_line) < 80:
+        lower_words = {w.lower().rstrip(".,:;!?") for w in words}
+        if not lower_words & sentence_indicators:
+            return first_line.rstrip(".,:;")
+
+    # Pattern 4: Check first 3 lines for a title-like line
+    for line in lines[:3]:
+        words = line.split()
+        if 2 <= len(words) <= 8 and len(line) < 80:
+            lower_words = {w.lower().rstrip(".,:;!?") for w in words}
+            if not lower_words & sentence_indicators:
+                return line.rstrip(".,:;")
+
+    return ""
+
+
+# Suffix-stripping stemmer for ATS keyword matching (no external dependencies)
+_SUFFIX_RULES = [
+    ("ational", "ate"), ("tional", "tion"), ("enci", "ence"),
+    ("anci", "ance"), ("izer", "ize"), ("abli", "able"),
+    ("alli", "al"), ("entli", "ent"), ("eli", "e"),
+    ("ousli", "ous"), ("ization", "ize"), ("ation", "ate"),
+    ("ator", "ate"), ("alism", "al"), ("iveness", "ive"),
+    ("fulness", "ful"), ("ousness", "ous"), ("aliti", "al"),
+    ("iviti", "ive"), ("biliti", "ble"), ("ness", ""),
+    ("ment", ""), ("able", ""), ("ible", ""),
+    ("ing", ""), ("tion", "t"), ("sion", "s"),
+    ("ies", "y"), ("ive", ""), ("ful", ""),
+    ("less", ""), ("ly", ""), ("ed", ""), ("er", ""),
+    ("es", ""), ("s", ""),
+]
+
+
+def _simple_stem(word: str) -> str:
+    """Lightweight English suffix-stripping stemmer for ATS keyword normalization."""
+    if len(word) <= 3:
+        return word
+    w = word.lower()
+    for suffix, replacement in _SUFFIX_RULES:
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[:-len(suffix)] + replacement
+    return w
+
+
+def _stemmed_text(text: str) -> str:
+    """Return a space-joined stemmed version of all words in text for fuzzy matching."""
+    tokens = re.findall(r'\b[a-zA-Z][a-zA-Z0-9\-]*\b', text.lower())
+    return " ".join(_simple_stem(t) for t in tokens)
+
 
 def optimize_keywords(cv_content: str, job_description: str = None, target_match: int = None) -> Dict[str, Any]:
-    """Improved ATS score checker with domain/title alignment"""
+    """Improved ATS score checker with multi-word phrase matching and domain/title alignment"""
 
     if not job_description:
         return get_default_analysis()
 
-    # Normalize & extract keyword sets
-    jd_keywords = set(re.findall(r'\b[a-zA-Z][a-zA-Z0-9\-]+\b', job_description.lower()))
-    cv_keywords = set(re.findall(r'\b[a-zA-Z][a-zA-Z0-9\-]+\b', cv_content.lower()))
+    # Normalize texts
+    cv_norm = cv_content.lower()
+    jd_norm = job_description.lower()
 
-    common_keywords = jd_keywords.intersection(cv_keywords)
-    keyword_match_pct = round(len(common_keywords) / len(jd_keywords) * 100) if jd_keywords else 0
-    keyword_score = min(40, keyword_match_pct)  # Cap at 40
+    # Multi-word & technical keyword extraction from JD
+    jd_phrases = extract_ats_phrases(job_description)
+    if not jd_phrases:
+        # Fallback to single token extraction if phrase extraction returned nothing
+        tokens = filter_keywords(re.findall(r'\b[a-zA-Z][a-zA-Z0-9\-]+\b', jd_norm))
+        jd_phrases = list(set(tokens))
 
-    # Quantification score
+    # Match extracted phrases against CV content with term equivalence + stemming
+    matched_phrases = []
+    missing_phrases = []
+    role_synonyms = {"developer", "engineer", "programmer", "specialist", "architect"}
+    cv_stemmed = _stemmed_text(cv_norm)
+
+    for phrase in jd_phrases:
+        # Direct substring match
+        if phrase in cv_norm:
+            matched_phrases.append(phrase)
+            continue
+        # Multi-word phrase: check if core technical terms exist in CV
+        words = phrase.split()
+        if len(words) > 1:
+            core_words = [w for w in words if w not in role_synonyms]
+            if core_words and all(w in cv_norm for w in core_words):
+                matched_phrases.append(phrase)
+                continue
+        # Stemmed match: "automation" matches "automated", "management" matches "managing"
+        phrase_stemmed = " ".join(_simple_stem(w) for w in words)
+        if phrase_stemmed in cv_stemmed:
+            matched_phrases.append(phrase)
+            continue
+        missing_phrases.append(phrase)
+
+    keyword_match_pct = round(len(matched_phrases) / len(jd_phrases) * 100) if jd_phrases else 0
+    keyword_score = min(55, round(keyword_match_pct * 0.55))  # Max 55 pts for keyword alignment
+
+    # Quantification score (Max 15 pts)
     quantitative_pct = calculate_quantitative_percentage(cv_content)
-    quantitative_score = min(int(quantitative_pct / 5), 20)  # Max 20 pts
+    quantitative_score = min(15, round(quantitative_pct * 0.25))
 
-    # Formatting score
+    # Formatting score (Max 15 pts)
     validation = validate_cv_format(cv_content)
-    format_score = 10 if validation["valid"] else 5
+    format_score = 15 if validation["valid"] else 10
 
-    # ==== NEW: Domain & Job Title Matching ====
-    title_match = 0
-    domain_score = 0
-    missing_keywords = list(jd_keywords - cv_keywords)
+    # Job title & domain matching (Max 15 pts)
+    title_match = 5
+    domain_score = 10
 
-    # Job title extraction
-    job_title_match = re.search(r'(?i)(applying for|job title|position:?)\s*([\w\s]+)', job_description)
-    if job_title_match:
-        title = job_title_match.group(2).strip().lower()
-        if title in cv_content.lower():
-            title_match = 10
+    # Job title extraction & matching against top section of CV
+    job_title = _extract_jd_title(job_description)
+    if job_title:
+        title_lower = job_title.strip().lower()
+        # Check if the extracted title (or its significant tokens) appears in the CV header
+        if title_lower in cv_norm[:600]:
+            title_match = 15
         else:
-            title_match = 0
-
-    # Domain relevance: if more than 70% of domain terms are missing, penalize
-    domain_terms = extract_domain_keywords(job_description)
-    domain_overlap = set(domain_terms).intersection(cv_keywords)
-    if len(domain_overlap) < max(1, len(domain_terms) * 0.3):
-        domain_score = 0
+            # Check individual meaningful tokens (3+ chars) of the title
+            title_tokens = [t for t in re.findall(r'\b[a-zA-Z]{3,}\b', title_lower)]
+            matching_title_tokens = [t for t in title_tokens if t in cv_norm[:600]]
+            if len(matching_title_tokens) >= 2:
+                title_match = 15
+            elif len(matching_title_tokens) == 1:
+                title_match = 10
     else:
-        domain_score = 20
+        # Fallback: check first few lines of JD for title-like content
+        jd_first_lines = " ".join(job_description.splitlines()[:5]).lower()
+        title_tokens = filter_keywords(re.findall(r'\b[a-zA-Z]{3,}\b', jd_first_lines))
+        matching_title_tokens = [t for t in title_tokens[:4] if t in cv_norm[:400]]
+        if len(matching_title_tokens) >= 2:
+            title_match = 15
+        elif len(matching_title_tokens) == 1:
+            title_match = 10
+
+    # Domain relevance
+    domain_terms = extract_domain_keywords(job_description)
+    if domain_terms:
+        domain_overlap = [d for d in domain_terms if d.lower() in cv_norm]
+        if len(domain_overlap) >= max(1, len(domain_terms) * 0.3):
+            domain_score = 10
+    else:
+        domain_score = 10
 
     # Total ATS Score
     ats_score = keyword_score + quantitative_score + format_score + title_match + domain_score
-    ats_score = min(100, ats_score)
+    ats_score = min(100, max(0, ats_score))
 
     # Final suggestion block
     suggestions = []
-    if quantitative_pct < 50:
+    if quantitative_pct < 30:
         suggestions.append("Add more quantifiable achievements with specific numbers and percentages")
     if not validation["valid"]:
-        suggestions.append("Fix formatting issues and add missing sections")
-    if title_match == 0:
-        suggestions.append("Ensure your resume reflects the job title from the JD")
-    if domain_score == 0:
-        suggestions.append("Align your resume to the domain-specific keywords in the JD")
-
-    missing_keywords = list(jd_keywords - cv_keywords)
-    filtered_missing_keywords = filter_keywords(missing_keywords)
+        for issue in validation.get("issues", []):
+            suggestions.append(f"Format suggestion: {issue}")
+    if title_match < 15:
+        suggestions.append("Include exact target job title in the professional summary or header")
+    if keyword_match_pct < 85 and missing_phrases:
+        top_missing = missing_phrases[:3]
+        suggestions.append(f"Surface relevant experience with key JD terms: {', '.join(top_missing)}")
 
     return {
         "score": ats_score,
         "keyword_match": keyword_match_pct,
         "suggestions": suggestions,
-        "missing_keywords": filtered_missing_keywords[:10],
-        "strengths": validation.get("strengths", ["Good structure", "Relevant experience"])
+        "missing_keywords": missing_phrases[:10],
+        "strengths": validation.get("strengths", ["Standard structure", "Relevant domain terms"])
     }
 
 def get_default_analysis():
@@ -300,7 +522,7 @@ def keyword_overlap_score(resume_text: str, jd_text: str) -> int:
     return round(len(overlap) / len(jd_keywords) * 100)
 
 def enforce_page_limit(content: str, max_pages: int = 2) -> str:
-    """Enforce page limit by trimming content intelligently"""
+    """Enforce page limit by trimming content intelligently while preserving keywords"""
     
     if not content:
         return "Error: No content to limit"
@@ -318,7 +540,7 @@ def enforce_page_limit(content: str, max_pages: int = 2) -> str:
     # Parse into sections
     sections = parse_content_sections(content)
     
-    # Priority order for sections
+    # Priority order for sections (higher priority = never trimmed)
     priority_sections = [
         'professional summary',
         'key skills',
@@ -330,6 +552,9 @@ def enforce_page_limit(content: str, max_pages: int = 2) -> str:
         'languages',
         'hobbies'
     ]
+    
+    # Sections that should NEVER be trimmed (preserve keywords)
+    never_trim_sections = {'key skills'}
     
     # Rebuild content with priority
     rebuilt_lines = []
@@ -349,9 +574,19 @@ def enforce_page_limit(content: str, max_pages: int = 2) -> str:
         section_content = get_section_by_priority(sections, priority)
         if section_content:
             available_lines = max_lines - current_line_count
-            if available_lines > 0:
-                # Trim section if necessary
-                trimmed_section = trim_section_content(section_content, available_lines)
+            
+            # Check if this section should never be trimmed
+            if priority in never_trim_sections:
+                # Add entire section without trimming
+                rebuilt_lines.extend(section_content)
+                current_line_count += len(section_content)
+            elif available_lines > 0:
+                # Trim section if necessary, but preserve minimum content
+                trimmed_section = trim_section_content_smart(
+                    section_content, 
+                    available_lines,
+                    preserve_min_bullets=2 if priority == 'work experience' else 0
+                )
                 rebuilt_lines.extend(trimmed_section)
                 current_line_count += len(trimmed_section)
     
@@ -425,6 +660,60 @@ def trim_section_content(section_content: List[str], max_lines: int) -> List[str
     else:
         return section_content[:max_lines]
 
+def trim_section_content_smart(section_content: List[str], max_lines: int, preserve_min_bullets: int = 0) -> List[str]:
+    """Smart trim that preserves minimum bullets and technology mentions"""
+    if len(section_content) <= max_lines:
+        return section_content
+    
+    if not section_content:
+        return []
+    
+    # If we have a header, keep it
+    header = []
+    content = section_content
+    if section_content[0].endswith(':'):
+        header = [section_content[0]]
+        content = section_content[1:]
+    
+    available_for_content = max_lines - len(header)
+    
+    if available_for_content <= 0:
+        return header
+    
+    # If we need to preserve minimum bullets, find bullet lines
+    if preserve_min_bullets > 0:
+        bullet_lines = []
+        non_bullet_lines = []
+        
+        for line in content:
+            stripped = line.strip()
+            if stripped.startswith('•') or stripped.startswith('-') or stripped.startswith('*'):
+                bullet_lines.append(line)
+            else:
+                non_bullet_lines.append(line)
+        
+        # Keep minimum bullets + fill remaining space with other content
+        kept_bullets = bullet_lines[:preserve_min_bullets]
+        remaining_bullets = bullet_lines[preserve_min_bullets:]
+        
+        # Calculate remaining space
+        space_for_other = available_for_content - len(kept_bullets)
+        
+        # Add non-bullet content first (like company headers, dates)
+        kept_non_bullet = non_bullet_lines[:space_for_other]
+        
+        # Combine and trim to fit
+        result = header + kept_non_bullet + kept_bullets
+        
+        # If still over limit, trim from the end (remove later bullets)
+        if len(result) > max_lines:
+            result = result[:max_lines]
+        
+        return result
+    else:
+        # Simple trim
+        return header + content[:available_for_content]
+
 def calculate_quantitative_percentage(content: str) -> float:
     """Calculate percentage of quantitative content"""
     lines = content.split('\n')
@@ -460,9 +749,9 @@ def enhance_with_action_verbs(content: str, intensity: str = "High") -> str:
             "executed", "delivered", "achieved", "established", "initiated"
         ],
         "Very High": [
-            "masterminded", "propelled", "catapulted", "dominated", "commanded",
-            "conquered", "devastated", "obliterated", "revolutionized", "transformed",
-            "pioneered", "trailblazed", "championed", "galvanized", "maximized"
+            "spearheaded", "orchestrated", "pioneered", "revolutionized", "transformed",
+            "engineered", "architected", "optimized", "streamlined", "accelerated",
+            "masterminded", "championed", "galvanized", "maximized", "propelled"
         ]
     }
     
@@ -500,8 +789,8 @@ def validate_cv_format(content: str) -> Dict[str, Any]:
     if not re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content):
         issues.append("Missing email address")
     
-    # Check for phone number
-    if not re.search(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', content):
+    # Check for phone number (support flexible local and international phone formats)
+    if not re.search(r'(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{7,15}\b', content):
         issues.append("Missing phone number")
     
     # Check for quantifiable achievements
@@ -511,7 +800,7 @@ def validate_cv_format(content: str) -> Dict[str, Any]:
     
     # Check content length
     word_count = len(content.split())
-    if word_count < 200:
+    if word_count < 100:
         issues.append("CV content is too short")
     elif word_count > 800:
         suggestions.append("Consider condensing content for better readability")

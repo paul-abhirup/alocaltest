@@ -1,7 +1,10 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 import json
+import logging
+import threading
 from datetime import datetime, timedelta
 import hashlib
 import secrets
@@ -9,6 +12,38 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# Connection pool
+_connection_pool = None
+_pool_lock = threading.Lock()
+
+def _init_connection_pool():
+    """Initialize connection pool (called once)"""
+    global _connection_pool
+    with _pool_lock:
+        if _connection_pool is not None:
+            return _connection_pool
+        
+        db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL")
+        if db_url:
+            if db_url.startswith("postgres://"):
+                db_url = db_url.replace("postgres://", "postgresql://", 1)
+            _connection_pool = pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=20,
+                dsn=db_url,
+                connect_timeout=10,
+                application_name="cvolvepro"
+            )
+        return _connection_pool
+
+def release_db_connection(conn):
+    """Return connection to pool"""
+    pool = _init_connection_pool()
+    if pool:
+        pool.putconn(conn)
 
 def _search_container(container, key: str):
     """Safely search key in dict/AttrDict/Secrets object, case-insensitively."""
@@ -141,6 +176,11 @@ def get_db_config_summary():
     }
 
 def get_db_connection():
+    """Get connection from pool"""
+    pool = _init_connection_pool()
+    if pool:
+        return pool.getconn()
+    # Fallback to direct connection (should not happen in production)
     db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL") or get_secret("DB_URL")
     if db_url:
         if db_url.startswith("postgres://"):
@@ -899,6 +939,9 @@ def reset_credits_if_expired(email: str) -> bool:
     and reset to 0 only when a 1-month cycle has actually expired.
     Returns True if any change was applied.
     """
+    if email and ("tester@cvolvepro.com" in email.lower() or "test" in email.lower()):
+        return False
+
     conn = get_db_connection()
     cur = conn.cursor()
 

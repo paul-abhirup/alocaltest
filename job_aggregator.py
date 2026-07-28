@@ -12,12 +12,15 @@ Sources:
 from __future__ import annotations
 
 import os
+import dotenv
+dotenv.load_dotenv()
 import re
 import copy
 import time
 import html
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Optional
@@ -30,7 +33,7 @@ from search_engine.normalizer import generate_search_variants, normalize_title
 from search_engine.title_match import is_title_relevant, compute_title_similarity
 from search_engine.filters import (
     has_negative_keyword, is_job_expired, is_experience_mismatched,
-    is_employment_type_mismatched, normalize_location_string
+    is_employment_type_mismatched, is_location_mismatched, normalize_location_string
 )
 from search_engine.deduplication import deduplicate_jobs
 from search_engine.explainability import generate_explainability
@@ -56,6 +59,25 @@ _ADZUNA_CURRENCY = {
     "gb": "£", "us": "$", "ca": "C$", "au": "A$", "in": "₹",
     "de": "€", "fr": "€", "nl": "€", "es": "€", "it": "€",
     "br": "R$", "mx": "Mex$", "pl": "zł", "za": "R", "nz": "NZ$", "sg": "S$"
+}
+
+COUNTRY_FULL_NAMES = {
+    "in": "India",
+    "us": "United States",
+    "gb": "United Kingdom",
+    "ca": "Canada",
+    "au": "Australia",
+    "de": "Germany",
+    "fr": "France",
+    "nl": "Netherlands",
+    "es": "Spain",
+    "it": "Italy",
+    "br": "Brazil",
+    "mx": "Mexico",
+    "pl": "Poland",
+    "za": "South Africa",
+    "sg": "Singapore",
+    "nz": "New Zealand",
 }
 
 SUPPORTED_COUNTRIES = {
@@ -227,108 +249,6 @@ def _yoe_adjustment(user_years: Optional[int], jd_text: str) -> int:
     return -min(10, (gap - 2) * 3)        # job wants notably more experience
 
 
-# ============================== Relevance & Scoring ===========================
-_STOP_WORDS = {
-    "a", "an", "the", "and", "or", "in", "for", "with", "at", "to", "of",
-    "on", "by", "from", "is", "be", "job", "jobs", "hiring", "wanted", "needed", "opportunity"
-}
-
-_SYNONYM_MAP = {
-    "dev": "developer",
-    "engineer": "developer",
-    "programmer": "developer",
-    "coder": "developer",
-    "sr": "senior",
-    "jr": "junior",
-    "js": "javascript",
-    "py": "python",
-    "ts": "typescript",
-    "reactjs": "react",
-    "react.js": "react",
-    "vuejs": "vue",
-    "vue.js": "vue",
-    "nodejs": "node",
-    "node.js": "node",
-    "frontend": "front-end",
-    "backend": "back-end",
-    "fullstack": "full-stack",
-    "ml": "ai",
-    "qa": "tester",
-    "mgr": "manager",
-}
-
-
-def _tokenize(text: str) -> list[str]:
-    if not text:
-        return []
-    cleaned = re.sub(r"[^\w\s\.-]", " ", text.lower())
-    words = re.split(r"[\s/]+", cleaned)
-    tokens = []
-    for w in words:
-        w = w.strip(".,-")
-        if w and w not in _STOP_WORDS:
-            norm = _SYNONYM_MAP.get(w, w)
-            tokens.append(norm)
-    return tokens
-
-
-def compute_title_relevance_score(query_title: str, job_title: str) -> float:
-    """Calculate title relevance score from 0.0 to 100.0.
-    Returns 100.0 if query_title is empty.
-    """
-    if not query_title or not query_title.strip():
-        return 100.0
-    if not job_title or not job_title.strip():
-        return 0.0
-
-    q_tokens = _tokenize(query_title)
-    if not q_tokens:
-        return 100.0
-
-    j_tokens = set(_tokenize(job_title))
-
-    # Calculate token overlap
-    matches = sum(1 for qt in q_tokens if qt in j_tokens)
-    overlap_score = (matches / len(q_tokens)) * 100.0
-
-    # For single-word query terms (e.g. "Python", "React"), check direct substring in title
-    if len(q_tokens) == 1 and overlap_score < 100.0:
-        q_raw = query_title.strip().lower()
-        j_raw = job_title.strip().lower()
-        if re.search(r"\b" + re.escape(q_raw) + r"\b", j_raw):
-            overlap_score = max(overlap_score, 80.0)
-
-    return min(100.0, max(0.0, overlap_score))
-
-
-def is_title_relevant(query_title: str, job_title: str, threshold: float = 30.0) -> bool:
-    """Drop jobs that fail minimum title relevance threshold to filter hoguspogus jobs."""
-    if not query_title or not query_title.strip():
-        return True
-    score = compute_title_relevance_score(query_title, job_title)
-    return score >= threshold
-
-
-def compute_recency_score(posted_date: str) -> float:
-    """Calculate recency score (10 to 100) based on posting date."""
-    if not posted_date or not posted_date.strip():
-        return 50.0
-    try:
-        date_str = posted_date.strip()[:10]
-        posted_ts = time.mktime(time.strptime(date_str, "%Y-%m-%d"))
-        days_old = max(0, (time.time() - posted_ts) / 86400.0)
-        if days_old <= 3:
-            return 100.0
-        if days_old <= 7:
-            return 80.0
-        if days_old <= 14:
-            return 60.0
-        if days_old <= 30:
-            return 40.0
-        return 20.0
-    except Exception:
-        return 50.0
-
 
 # ============================== Source adapters ===============================
 class SourceAdapter:
@@ -344,12 +264,30 @@ class SourceAdapter:
     def normalize(self, raw: dict) -> Optional[Job]:
         raise NotImplementedError
 
-    def _request(self, url, *, params=None, method="GET", json_body=None) -> dict:
+    def _request(self, url, *, params=None, method="GET", json_body=None,
+                  max_retries: int = 2) -> dict:
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        resp = requests.request(method, url, params=params, json=json_body,
-                                headers=headers, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = requests.request(method, url, params=params, json=json_body,
+                                        headers=headers, timeout=DEFAULT_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                status = getattr(e.response, "status_code", None) if e.response is not None else None
+                if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 4))
+                    continue
+                raise
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                if attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 4))
+                    continue
+                raise
+        raise last_exc  # unreachable but satisfies type checker
 
 
 class RemotiveAdapter(SourceAdapter):
@@ -515,15 +453,19 @@ class AdzunaAdapter(SourceAdapter):
 class JSearchAdapter(SourceAdapter):
     source = "jsearch"
     source_name = "JSearch"
-    BASE = "https://jsearch.p.rapidapi.com/search"
+    BASE = "https://jsearch.p.rapidapi.com/search-v2"
 
     def __init__(self):
         self.api_key = os.getenv("JSEARCH_API_KEY")
 
     def enabled(self):
+        if not self.api_key:
+            self.api_key = os.getenv("JSEARCH_API_KEY")
         return bool(self.api_key)
 
     def fetch(self, query):
+        if not self.api_key:
+            self.api_key = os.getenv("JSEARCH_API_KEY")
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
@@ -533,11 +475,29 @@ class JSearchAdapter(SourceAdapter):
         q_text = query.title
         if query.location:
             q_text += f" in {query.location}"
-        params = {"query": q_text, "page": "1", "num_pages": "1"}
-        resp = requests.get(self.BASE, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
+        
+        num_pages = max(2, min(5, (query.limit + 9) // 10))
+        params = {"query": q_text, "page": "1", "num_pages": str(num_pages)}
+        if query.country and query.country.lower() != "all":
+            params["country"] = query.country.lower()
+        try:
+            resp = requests.get(self.BASE, headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                resp = requests.get("https://jsearch.p.rapidapi.com/search", headers=headers, params=params, timeout=15)
+                resp.raise_for_status()
+            else:
+                raise
         data = resp.json()
-        return (data.get("data") or [])[: query.limit]
+        raw_data = data.get("data")
+        if isinstance(raw_data, dict):
+            jobs = raw_data.get("jobs") or []
+        elif isinstance(raw_data, list):
+            jobs = raw_data
+        else:
+            jobs = []
+        return jobs[: max(query.limit * 2, 20)]
 
     def normalize(self, raw):
         title = (raw.get("job_title") or "").strip()
@@ -547,10 +507,11 @@ class JSearchAdapter(SourceAdapter):
         city = raw.get("job_city") or ""
         country = raw.get("job_country") or ""
         location = ", ".join(filter(None, [city, country])) or "—"
-        is_remote = bool(raw.get("job_is_remote"))
+        desc = strip_html(raw.get("job_description") or "")
+        
+        is_remote = bool(raw.get("job_is_remote")) or "remote" in title.lower() or "remote" in location.lower() or "remote" in desc[:300].lower()
         remote_type = REMOTE_WORLDWIDE if is_remote else ONSITE_HYBRID
         posted = (raw.get("job_posted_at_datetime_utc") or "")[:10]
-        desc = strip_html(raw.get("job_description") or "")
 
         salary = None
         min_s = raw.get("job_min_salary")
@@ -559,13 +520,15 @@ class JSearchAdapter(SourceAdapter):
         if min_s and max_s:
             salary = f"{cur}{int(min_s):,}–{cur}{int(max_s):,}"
 
+        url = raw.get("job_apply_link") or raw.get("job_google_link") or ""
+
         return Job(
             title=title,
             company=company,
             location=location,
             remote_type=remote_type,
             job_type=(raw.get("job_employment_type") or "").title() or "—",
-            url=raw.get("job_apply_link") or "",
+            url=url,
             source=self.source,
             source_name=self.source_name,
             posted_date=posted,
@@ -587,7 +550,9 @@ class JoobleAdapter(SourceAdapter):
 
     def fetch(self, query):
         url = f"{self.BASE}/{self.api_key}"
-        payload = {"keywords": query.title, "location": query.location}
+        c_name = COUNTRY_FULL_NAMES.get((query.country or "").lower(), query.country or "")
+        loc = query.location or (c_name if query.country and query.country.lower() != "all" else "")
+        payload = {"keywords": query.title, "location": loc}
         data = self._request(url, method="POST", json_body=payload)
         return (data.get("jobs") or [])[: query.limit]
 
@@ -661,11 +626,11 @@ class FindworkAdapter(SourceAdapter):
 
 def default_adapters() -> list[SourceAdapter]:
     return [
+        JSearchAdapter(),
+        AdzunaAdapter(),
+        JoobleAdapter(),
         RemotiveAdapter(),
         ArbeitnowAdapter(),
-        AdzunaAdapter(),
-        JSearchAdapter(),
-        JoobleAdapter(),
         FindworkAdapter(),
     ]
 
@@ -673,6 +638,7 @@ def default_adapters() -> list[SourceAdapter]:
 # ============================== Caching =======================================
 # Module-level, user-independent cache: holds normalized jobs WITHOUT match scores.
 _CACHE: dict[str, tuple[float, list[Job]]] = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def _cache_ttl_seconds() -> int:
@@ -683,7 +649,8 @@ def _cache_ttl_seconds() -> int:
 
 
 def clear_cache() -> None:
-    _CACHE.clear()
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 # ============================== Orchestration =================================
@@ -736,7 +703,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
 
     for adapter in adapters:
         ckey = f"{adapter.source}:{query.cache_key([adapter.source])}"
-        cached = _CACHE.get(ckey)
+        with _CACHE_LOCK:
+            cached = _CACHE.get(ckey)
         if cached and (now - cached[0]) < ttl:
             # Work on copies — dedupe/scoring must never mutate the cached (shared) copy.
             collected.extend(copy.deepcopy(cached[1]))
@@ -753,7 +721,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
                     continue
                 if job and job.title:
                     jobs.append(job)
-            _CACHE[ckey] = (now, jobs)                 # pristine, unscored
+            with _CACHE_LOCK:
+                _CACHE[ckey] = (now, jobs)                 # pristine, unscored
             collected.extend(copy.deepcopy(jobs))      # per-request working copies
             status[adapter.source] = "ok"
         except SourceAuthError as e:
@@ -761,6 +730,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
             logger.warning("%s", e)
         except Exception as e:
             # stale-while-error: serve last good payload even past TTL
+            with _CACHE_LOCK:
+                cached = _CACHE.get(ckey)
             if cached:
                 collected.extend(copy.deepcopy(cached[1]))
                 status[adapter.source] = "stale"
@@ -782,6 +753,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         if is_experience_mismatched(query.years_experience, query.title, job.title, job.description):
             continue
         if is_employment_type_mismatched(query.work_types, job.remote_type, job.job_type):
+            continue
+        if is_location_mismatched(job.location, query.location, query.country):
             continue
 
         surviving_jobs.append(job)

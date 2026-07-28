@@ -114,9 +114,11 @@ class TestHashJd(unittest.TestCase):
 class TestGuardrail(unittest.TestCase):
     def test_guardrail_has_key_phrases(self):
         g = TRUTHFULNESS_GUARDRAIL.lower()
-        self.assertIn("do not", g)
+        # New guardrail uses "must not" instead of "do not"
+        self.assertTrue("must not" in g or "do not" in g)
         self.assertTrue("invent" in g or "fabricate" in g)
-        self.assertIn("omit", g)
+        # New guardrail emphasizes surfacing skills rather than omitting
+        self.assertTrue("surface" in g or "omit" in g)
 
 
 class TestFabricationRemoved(unittest.TestCase):

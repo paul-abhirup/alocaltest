@@ -15,10 +15,8 @@ def score_freshness(posted_date: str) -> float:
         posted_ts = time.mktime(time.strptime(date_str, "%Y-%m-%d"))
         days_old = max(0.0, (time.time() - posted_ts) / 86400.0)
 
-        if days_old <= 0.5:
-            return 100.0
         if days_old <= 1.0:
-            return 98.0
+            return 100.0
         if days_old <= 3.0:
             return 95.0
         if days_old <= 7.0:

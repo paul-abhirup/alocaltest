@@ -12,11 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import job_aggregator as ja
 from job_aggregator import (
-    Job, SearchQuery, RemotiveAdapter, ArbeitnowAdapter, AdzunaAdapter,
+    Job, SearchQuery, RemotiveAdapter, ArbeitnowAdapter, AdzunaAdapter, JSearchAdapter,
     SourceAdapter, SourceAuthError, strip_html, infer_seniority,
     _parse_required_years, _yoe_adjustment, search_jobs, clear_cache,
     REMOTE_WORLDWIDE, REMOTE_UNKNOWN, ONSITE_HYBRID, CONTRACT,
 )
+from search_engine.title_match import compute_title_similarity, is_title_relevant as se_is_title_relevant
+from search_engine.ranking.freshness import score_freshness
 from utils import keyword_overlap_score
 
 
@@ -56,6 +58,21 @@ ADZUNA_RAW = {
     "contract_time": "full_time",
     "contract_type": "permanent",
     "description": "Python developer with Django. 3 years experience required.",
+}
+
+JSEARCH_RAW = {
+    "job_title": "Python Developer",
+    "employer_name": "Tech Corp",
+    "job_city": "San Francisco",
+    "job_country": "US",
+    "job_is_remote": True,
+    "job_posted_at_datetime_utc": "2026-07-20T10:00:00.000Z",
+    "job_description": "<p>Build Python &amp; Django services.</p>",
+    "job_min_salary": 120000,
+    "job_max_salary": 150000,
+    "job_salary_currency": "$",
+    "job_employment_type": "FULLTIME",
+    "job_apply_link": "https://example.com/apply/123",
 }
 
 
@@ -183,6 +200,25 @@ class TestNormalize(unittest.TestCase):
         raw = dict(ADZUNA_RAW); raw.pop("salary_min"); raw.pop("salary_max")
         self.assertIsNone(a.normalize(raw).salary)
 
+    def test_jsearch_normalization(self):
+        j = JSearchAdapter().normalize(JSEARCH_RAW)
+        self.assertEqual(j.title, "Python Developer")
+        self.assertEqual(j.company, "Tech Corp")
+        self.assertEqual(j.location, "San Francisco, US")
+        self.assertEqual(j.remote_type, REMOTE_WORLDWIDE)
+        self.assertEqual(j.posted_date, "2026-07-20")
+        self.assertEqual(j.salary, "$120,000–$150,000")
+        self.assertEqual(j.job_type, "Fulltime")
+        self.assertEqual(j.url, "https://example.com/apply/123")
+        self.assertNotIn("<", j.description)
+
+    def test_jsearch_missing_title_or_salary(self):
+        adapter = JSearchAdapter()
+        self.assertIsNone(adapter.normalize({"job_title": ""}))
+        raw_no_salary = dict(JSEARCH_RAW)
+        raw_no_salary.pop("job_min_salary")
+        self.assertIsNone(adapter.normalize(raw_no_salary).salary)
+
 
 class TestOrchestration(unittest.TestCase):
     def setUp(self):
@@ -302,23 +338,24 @@ class TestHTMLScraper(unittest.TestCase):
 
 
 class TestTitleGuardrailAndRecency(unittest.TestCase):
-    def test_title_relevance_score(self):
-        # Exact/synonym match
-        self.assertEqual(ja.compute_title_relevance_score("Python Developer", "Senior Python Developer"), 100.0)
-        self.assertEqual(ja.compute_title_relevance_score("React Dev", "Frontend React Engineer"), 100.0)
+    def test_title_similarity_score(self):
+        # Exact match
+        self.assertEqual(compute_title_similarity("Python Developer", "Python Developer"), 100.0)
+        # Normalized match (abbreviation expansion)
+        self.assertGreater(compute_title_similarity("Python Developer", "Senior Python Developer"), 40.0)
 
         # Irrelevant titles
-        self.assertEqual(ja.compute_title_relevance_score("Python Developer", "Sales Operations Executive"), 0.0)
-        self.assertEqual(ja.compute_title_relevance_score("Data Analyst", "Customer Support Specialist"), 0.0)
+        self.assertEqual(compute_title_similarity("Python Developer", "Sales Operations Executive"), 0.0)
+        self.assertEqual(compute_title_similarity("Data Analyst", "Customer Support Specialist"), 0.0)
 
     def test_is_title_relevant_drops_hoguspogus(self):
-        self.assertTrue(ja.is_title_relevant("Python Developer", "Senior Python Developer"))
-        self.assertFalse(ja.is_title_relevant("Python Developer", "Marketing Manager"))
+        self.assertTrue(se_is_title_relevant("Python Developer", "Senior Python Developer"))
+        self.assertFalse(se_is_title_relevant("Python Developer", "Marketing Manager"))
 
     def test_recency_scoring(self):
         today_str = time.strftime("%Y-%m-%d")
-        self.assertEqual(ja.compute_recency_score(today_str), 100.0)
-        self.assertEqual(ja.compute_recency_score("2020-01-01"), 20.0)
+        self.assertEqual(score_freshness(today_str), 100.0)
+        self.assertLess(score_freshness("2020-01-01"), 20.0)
 
     def test_search_jobs_filters_irrelevant_jobs(self):
         relevant = make_job(url="https://job/1", title="Senior Python Engineer")
@@ -328,6 +365,31 @@ class TestTitleGuardrailAndRecency(unittest.TestCase):
         # Only relevant job should be shown
         self.assertEqual(res["counts"]["shown"], 1)
         self.assertEqual(res["jobs"][0].title, "Senior Python Engineer")
+
+
+class TestLocationFilter(unittest.TestCase):
+    def test_location_mismatch_returns_true(self):
+        from search_engine.filters import is_location_mismatched
+        # Job in India, user wants US -> should mismatch
+        self.assertTrue(is_location_mismatched("Bengaluru, India", "", "us"))
+
+    def test_location_match_returns_false(self):
+        from search_engine.filters import is_location_mismatched
+        # Job in US, user wants US -> should not mismatch
+        self.assertFalse(is_location_mismatched("San Francisco, US", "", "us"))
+
+    def test_worldwide_always_passes(self):
+        from search_engine.filters import is_location_mismatched
+        self.assertFalse(is_location_mismatched("Worldwide", "", "us"))
+        self.assertFalse(is_location_mismatched("Anywhere", "", "gb"))
+
+    def test_empty_query_passes(self):
+        from search_engine.filters import is_location_mismatched
+        self.assertFalse(is_location_mismatched("London, UK", "", ""))
+
+    def test_country_all_passes(self):
+        from search_engine.filters import is_location_mismatched
+        self.assertFalse(is_location_mismatched("Berlin, Germany", "", "all"))
 
 
 if __name__ == "__main__":

@@ -1117,6 +1117,9 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
             except Exception:
                 pass
 
+        call_kwargs["optimization_depth"] = "max_ats"
+        call_kwargs["return_metadata"] = True
+
         cv_result = cv_generator.generate_cv(**call_kwargs)
     except TypeError as te:
         traceback.print_exc()
@@ -1142,6 +1145,8 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
         text_to_use = None
 
         # If generator returned a dict with explicit docx/pdf keys, honour them first
+        cv_metadata = cv_result if isinstance(cv_result, dict) else {}
+
         if isinstance(cv_result, dict):
             if "docx_bytes" in cv_result:
                 raw = cv_result["docx_bytes"]
@@ -1166,6 +1171,8 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
                 text_to_use = cv_result["text"]
             elif "cv_text" in cv_result:
                 text_to_use = cv_result["cv_text"]
+            elif "optimized_content" in cv_result:
+                text_to_use = cv_result["optimized_content"]
             else:
                 # fallback to string representation (may contain text)
                 text_to_use = str(cv_result)
@@ -1199,7 +1206,7 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
                 if not text_to_use or not str(text_to_use).strip():
                     # look for common text keys in dict result
                     if isinstance(cv_result, dict):
-                        text_to_use = cv_result.get("text") or cv_result.get("cv_text") or cv_result.get("plain_text") or cv_result.get("result") or None
+                        text_to_use = cv_result.get("optimized_content") or cv_result.get("text") or cv_result.get("cv_text") or cv_result.get("plain_text") or cv_result.get("result") or None
 
                     # If still nothing and we have pdf bytes, try to extract text (if helper exists)
                     if (not text_to_use or not str(text_to_use).strip()) and file_bytes and file_ext == "pdf":
@@ -1288,7 +1295,7 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
             original_resume=(req.resume_base64 or "")[:200000],
             generated_cv=(file_b64 or "")[:500000],
             template_used=call_kwargs.get("template", DEFAULT_TEMPLATE),
-            ats_score=0,
+            ats_score=int(cv_metadata.get("ats_score") or 0),
             target_match=(req.target_match or 0),
             processing_time=0.0
         )
@@ -1301,10 +1308,21 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
     except Exception:
         updated_credits = None
 
+    meta_payload = {
+        "measured_ats_score": cv_metadata.get("ats_score"),
+        "target_ats_score": cv_metadata.get("target_ats_score", req.target_match or 100),
+        "keyword_match": cv_metadata.get("keyword_match"),
+        "missing_keywords": cv_metadata.get("missing_keywords", []),
+        "optimization_summary": {
+            "repair_passes_used": cv_metadata.get("repair_passes_used", 0),
+            "fixes_applied": cv_metadata.get("fixes_applied", []),
+            "unsupported_gaps": cv_metadata.get("unsupported_gaps", []),
+        },
+    }
     if file_ext == "docx":
-        return {"success": True, "docx_base64": file_b64, "file_mime": file_mime, "file_ext": file_ext, "credits": updated_credits}
+        return {"success": True, "docx_base64": file_b64, "file_mime": file_mime, "file_ext": file_ext, "credits": updated_credits, **meta_payload}
     else:
-        return {"success": True, "pdf_base64": file_b64, "file_mime": file_mime, "file_ext": file_ext, "credits": updated_credits}
+        return {"success": True, "pdf_base64": file_b64, "file_mime": file_mime, "file_ext": file_ext, "credits": updated_credits, **meta_payload}
 
 # Optional debug endpoint to preview normalized text (useful during testing)
 @app.post("/api/debug/preview_cv")

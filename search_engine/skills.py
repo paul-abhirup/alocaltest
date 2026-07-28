@@ -53,6 +53,20 @@ _SKILL_PATTERNS = {
     "TensorFlow": r"\btensorflow\b",
     "Scikit-Learn": r"\bscikit-learn\b|\bsklearn\b",
     "LLMs": r"\b(llm|llms|gpt|transformers|rag)\b",
+
+    # Culinary / Hospitality
+    "Culinary Arts": r"\b(culinary|culinary arts)\b",
+    "Food Safety": r"\b(food safety|hygiene|haccp)\b",
+    "Menu Planning": r"\b(menu planning|menu development)\b",
+    "Kitchen Management": r"\b(kitchen management|kitchen operations)\b",
+    "Baking": r"\b(baking|baker|pastry)\b",
+    "Catering": r"\b(catering|banquet|event)\b",
+    "Garde Manger": r"\bgarde\s*manger\b",
+    "Food Preparation": r"\b(food preparation|prep cook|prep)\b",
+    "Grill": r"\b(grill|grill cook|broiler)\b",
+    "Sauté": r"\b(saut[eé]|saute)\b",
+    "Butchery": r"\b(butcher|butchery|meat cutting)\b",
+    "Inventory Management": r"\b(inventory management|stock control|food cost)\b",
 }
 
 
@@ -77,7 +91,7 @@ def compute_skill_match_score(query_text: str, job_text: str) -> tuple[float, li
     j_skills = set(extract_skills(job_text))
 
     if not q_skills:
-        return 50.0, list(j_skills)[:5]
+        return 50.0, []
 
     if not j_skills:
         return 0.0, []

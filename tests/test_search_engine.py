@@ -15,6 +15,7 @@ from search_engine.filters import (
 from search_engine.deduplication import compute_job_fingerprint, deduplicate_jobs
 from search_engine.skills import extract_skills, compute_skill_match_score
 from search_engine.explainability import generate_explainability
+from search_engine.resume_match import extract_distinctive_terms, is_resume_job_mismatched
 from search_engine.ranking.scorer import calculate_composite_score
 from search_engine.ranking.freshness import score_freshness
 from search_engine.ranking.company_score import score_company
@@ -126,6 +127,82 @@ class TestScoringAndExplainability(unittest.TestCase):
         self.assertGreaterEqual(score, 50)
         explain = generate_explainability(job.title, "Python Developer", sim, skills, job.posted_date, job.remote_type, score)
         self.assertTrue(len(explain) > 0)
+
+
+class TestResumeMatch(unittest.TestCase):
+    def test_distinctive_terms_culinary(self):
+        resume = "Commi Chef with kitchen experience and food safety training. Commi Chef at fine dining restaurant."
+        terms = extract_distinctive_terms(resume, top_n=10)
+        self.assertIn("chef", terms)
+        self.assertIn("commi", terms)
+        self.assertIn("kitchen", terms)
+        self.assertNotIn("team", terms)
+        self.assertNotIn("experience", terms)
+        self.assertNotIn("training", terms)
+
+    def test_distinctive_terms_tech(self):
+        resume = "Python developer with AWS and Docker. Python backend developer."
+        terms = extract_distinctive_terms(resume, top_n=10)
+        self.assertIn("python", terms)
+        self.assertIn("docker", terms)
+        self.assertIn("backend", terms)
+        self.assertIn("aws", terms)
+
+    def test_mismatch_detects_cross_domain(self):
+        resume = "Worked as Commi Chef in busy kitchen. Responsible for food prep, cooking, menu planning, hygiene standards. Trained junior staff on kitchen safety."
+        job_title = "Senior Chef Developer"
+        job_desc = "Looking for a Chef Developer with CI/CD, Go, Java, SQL, Terraform."
+        self.assertTrue(is_resume_job_mismatched(resume, job_title, job_desc))
+
+    def test_mismatch_allows_same_domain(self):
+        resume = "Worked as Commi Chef in busy kitchen. Responsible for food prep, cooking, menu planning, hygiene standards. Trained junior staff on kitchen safety."
+        job_title = "Sous Chef"
+        job_desc = "Looking for an experienced Sous Chef for fine dining restaurant. Food preparation, cooking, menu planning, team leadership, kitchen hygiene."
+        self.assertFalse(is_resume_job_mismatched(resume, job_title, job_desc))
+
+    def test_no_resume_passes(self):
+        self.assertFalse(is_resume_job_mismatched(None, "Software Engineer", "Java, Python"))
+
+    def test_empty_resume_passes(self):
+        self.assertFalse(is_resume_job_mismatched("", "Software Engineer", "Java, Python"))
+
+    def test_generic_resume_passes(self):
+        resume = "Hardworking team player with communication skills and experience."
+        job_title = "Software Engineer"
+        job_desc = "Java, Python, team player."
+        self.assertFalse(is_resume_job_mismatched(resume, job_title, job_desc))
+
+
+class TestPhantomSkillMatchFix(unittest.TestCase):
+    def test_no_query_skills_returns_empty_matched(self):
+        q = "commi chef"
+        j = "Looking for a Go developer with CI/CD, Terraform, Java, SQL."
+        score, matched = compute_skill_match_score(q, j)
+        self.assertEqual(score, 50.0)
+        self.assertEqual(matched, [])
+
+    def test_explainability_no_skills_bullet_when_no_match(self):
+        bullets = generate_explainability(
+            "Senior Chef Developer", "commi chef", 50.0, [],
+            "2026-07-11", "Onsite", 55, "Senior"
+        )
+        skill_bullets = [b for b in bullets if "Skills match" in b]
+        self.assertEqual(len(skill_bullets), 0)
+
+    def test_culinary_skills_extracted(self):
+        text = "Culinary Arts degree, HACCP certified, food preparation and kitchen management."
+        skills = extract_skills(text)
+        self.assertIn("Culinary Arts", skills)
+        self.assertIn("Food Safety", skills)
+        self.assertIn("Food Preparation", skills)
+        self.assertIn("Kitchen Management", skills)
+
+    def test_cross_domain_skill_match_zero(self):
+        q = "commi chef"
+        j = "DevOps engineer with Go, Terraform, CI/CD, Kubernetes."
+        score, matched = compute_skill_match_score(q, j)
+        self.assertEqual(score, 50.0)
+        self.assertEqual(matched, [])
 
 
 if __name__ == "__main__":

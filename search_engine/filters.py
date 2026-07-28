@@ -8,6 +8,7 @@ import time
 from typing import Optional
 from search_engine.config import DEFAULT_NEGATIVE_KEYWORDS, MAX_JOB_AGE_DAYS, EXPERIENCE_BUCKETS, EMPLOYMENT_TYPES
 from search_engine.normalizer import normalize_title
+from search_engine.resume_match import is_resume_job_mismatched
 
 
 def has_negative_keyword(job_title: str, query_title: str = "", custom_negative_keywords: Optional[set[str]] = None) -> bool:

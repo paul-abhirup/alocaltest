@@ -33,11 +33,12 @@ from search_engine.normalizer import generate_search_variants, normalize_title
 from search_engine.title_match import is_title_relevant, compute_title_similarity
 from search_engine.filters import (
     has_negative_keyword, is_job_expired, is_experience_mismatched,
-    is_employment_type_mismatched, is_location_mismatched, normalize_location_string
+    is_employment_type_mismatched, is_location_mismatched, normalize_location_string,
 )
 from search_engine.deduplication import deduplicate_jobs
 from search_engine.explainability import generate_explainability
 from search_engine.ranking.scorer import calculate_composite_score
+from search_engine.resume_match import is_resume_job_mismatched
 
 logger = logging.getLogger(__name__)
 
@@ -741,7 +742,7 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
 
     deduped = deduplicate_jobs(_dedupe(collected))
 
-    # Phase 3-9: Hard Filters (Age Cutoff < 45d, Negative Keywords, Title Guardrail < 40%, Experience Mismatch, Job Type Mismatch)
+    # Phase 3-9: Hard Filters (Age Cutoff < 45d, Negative Keywords, Title Guardrail < 40%, Experience Mismatch, Job Type Mismatch, Domain Mismatch)
     surviving_jobs: list[Job] = []
     for job in deduped:
         if is_job_expired(job.posted_date):
@@ -755,6 +756,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         if is_employment_type_mismatched(query.work_types, job.remote_type, job.job_type):
             continue
         if is_location_mismatched(job.location, query.location, query.country):
+            continue
+        if is_resume_job_mismatched(resume_text, job.title, job.description):
             continue
 
         surviving_jobs.append(job)

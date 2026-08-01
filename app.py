@@ -26,14 +26,27 @@ load_dotenv()
 
 
 # Import custom modules
-from database import init_db, get_user_special_discount, get_user_data, save_user_session, get_business_plan_info, get_user_credits, get_business_credits, update_business_credits, activate_business_plan, get_db_connection, create_business_user, get_business_user, authenticate_business_user, save_business_payment, save_payment, update_user_credits, payment_exists, register_user, verify_user_email, set_email_otp, verify_email_otp, save_cv_generation, record_credit_usage, reset_credits_if_expired, save_alignment_answers, get_alignment_answers
+from database import init_db, get_user_special_discount, get_user_data, save_user_session, get_business_plan_info, get_user_credits, get_business_credits, get_db_connection, create_business_user, get_business_user, authenticate_business_user, save_business_payment, save_payment, payment_exists, register_user, verify_user_email, set_email_otp, verify_email_otp, save_cv_generation, record_credit_usage, reset_credits_if_expired, save_alignment_answers, get_alignment_answers
 from auth import authenticate_user, logout_user, get_current_user, hash_password
 from payment import process_payment, check_subscription, apply_discount_code, create_checkout_session
-from cv_generator import generate_cv,recommend_jobs_from_resume_ai, generate_cover_letter, extract_resume_text, analyze_cv_ats_score, generate_interview_qa, export_interview_qa, analyze_cv_jd_gaps, hash_jd, export_cover_letter
+from cv_generator import generate_cv,recommend_jobs_from_resume_ai, generate_cover_letter, extract_resume_text, analyze_cv_ats_score, export_interview_qa, analyze_cv_jd_gaps, hash_jd, export_cover_letter
 import job_aggregator as ja
 from templates import apply_template
 from utils import optimize_keywords, enforce_page_limit, get_gemini_response, get_all_country_dial_codes
-from interview_module import show_interview_practice_page, DURATION_CREDITS
+from interview_module import show_interview_practice_page, _init_session as _init_interview_session
+import pricing
+from credit_engine import (
+    wallet_balance,
+    spend_credits,
+    has_enough,
+    ats_charge_or_free,
+    purchase_plan,
+    purchase_pack,
+    get_credit_packs,
+    recent_transactions,
+    backfill_wallets,
+    can_use_f2f,
+)
 
 
 
@@ -115,12 +128,16 @@ def handle_stripe_return_globally():
     if _qp_get("service") == "jobsqa":
         return
     import stripe
-    from database import get_db_connection, save_payment
-    from payment import check_subscription, create_subscription
-    from database import payment_exists as db_payment_exists, reset_credits_if_expired
+    from database import save_payment, payment_exists as db_payment_exists
 
     stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_default")
-    PLAN_CREDITS = {"Premium": 110, "Premium + Premium Classic": 125}
+
+    # Legacy plan names → current plans (for old Stripe metadata / special offer)
+    LEGACY_PLAN_MAP = {
+        "Premium": "Career Pro",
+        "Premium + Premium Classic": "Interview Pro",
+    }
+    PACK_CREDITS_TO_NAME = {p["credits"]: p["name"] for p in pricing.PACKS}
 
     success    = (_qp_get("success", "").lower() == "true")
     typ        = _qp_get("type", "")
@@ -148,113 +165,75 @@ def handle_stripe_return_globally():
             st.warning("Missing user email in Stripe metadata; cannot credit.")
             return
 
-        # Idempotency: skip if we already stored this payment
-        if db_payment_exists(session_id):
-            st.session_state.processed_sessions.add(session_id)
-            return
+        # DB-level idempotency: never credit the same Stripe session twice.
+        try:
+            if db_payment_exists(session_id):
+                st.session_state.processed_sessions.add(session_id)
+                return
+        except Exception:
+            pass
 
         amount_paid = (sess.get("amount_total") or 0) / 100.0
 
         if typ == "subscription":
-            plan = (md.get("plan") or plan_qp or "Premium").strip()
-            credits_to_add = int(md.get("credits") or PLAN_CREDITS.get(plan, 125))
-
-            # start cycle today and set balance to plan credits
-            conn = get_db_connection(); cur = conn.cursor()
-            cur.execute("""
-                UPDATE users
-                   SET credits = %s,
-                       credit_cycle_start = CURRENT_TIMESTAMP
-                 WHERE email=%s
-            """, (credits_to_add, user_email))
-            conn.commit(); cur.close(); conn.close()
-
-            create_subscription(user_email, plan, session_id)
-            save_payment(user_email, amount_paid, "subscription", session_id, credits_purchased=credits_to_add)
-            st.success(f"🎉 {plan} active for {user_email}. {credits_to_add} credits added.")
+            plan = (md.get("plan") or plan_qp or "Career Pro").strip()
+            plan = LEGACY_PLAN_MAP.get(plan, plan)
+            if plan not in pricing.PLANS:
+                st.warning(f"Unknown plan '{plan}'; payment recorded but not activated.")
+                save_payment(user_email, amount_paid, "subscription", session_id, credits_purchased=0)
+                return
+            res = purchase_plan("individual", user_email, plan, stripe_session_id=session_id)
+            if res.get("ok"):
+                save_payment(user_email, amount_paid, "subscription", session_id,
+                             credits_purchased=res["credits"])
+                st.success(f"🎉 {plan} active for {user_email}. {res['credits']} credits added.")
 
         elif typ == "credits":
-            # read credits from metadata first, then query param as fallback
-            credits_to_add = int(md.get("credits") or credits_qp or 0)
-
-            # Optional: enforce active subscription for top-ups
-            sub_active = check_subscription(user_email)
-            if not sub_active:
+            pack_name = (md.get("pack") or "").strip()
+            if not pack_name:
+                pack_name = PACK_CREDITS_TO_NAME.get(int(md.get("credits") or credits_qp or 0))
+            if not pack_name:
                 save_payment(user_email, amount_paid, "credits", session_id, credits_purchased=0)
-                st.error("Top-ups require an active plan. Payment recorded, but credits not added.")
+                st.warning("Payment succeeded but no pack name was provided.")
+                return
+            res = purchase_pack("individual", user_email, pack_name, stripe_session_id=session_id)
+            if res.get("ok"):
+                save_payment(user_email, amount_paid, "credits", session_id,
+                             credits_purchased=res["credits"])
+                st.success(f"🎉 {res['pack']} ({res['credits']} credits) added for {user_email}.")
             else:
-                try:
-                    reset_credits_if_expired(user_email)
-                except Exception:
-                    pass
-
-                if credits_to_add > 0:
-                    conn = get_db_connection(); cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE users
-                           SET credits = COALESCE(credits, 0) + %s
-                         WHERE email=%s
-                    """, (credits_to_add, user_email))
-                    conn.commit(); cur.close(); conn.close()
-
-                    save_payment(user_email, amount_paid, "credits", session_id, credits_purchased=credits_to_add)
-                    st.success(f"🎉 {credits_to_add} credits added for {user_email}.")
-                else:
-                    save_payment(user_email, amount_paid, "credits", session_id, credits_purchased=0)
-                    st.warning("Payment succeeded but no credits value was provided.")
+                save_payment(user_email, amount_paid, "credits", session_id, credits_purchased=0)
+                st.error(f"Could not add pack: {res.get('reason')}")
 
         # ======================================================
         # BUSINESS PLAN HANDLER
         # ======================================================
 
         elif typ == "business":
+            from database import save_business_payment
 
             plan_name = md.get("plan_name", "Starter")
+            if plan_name not in pricing.CORPORATE_PLANS:
+                st.warning(f"Unknown business plan '{plan_name}'; payment recorded but not activated.")
+                save_business_payment(user_email, amount_paid, "business_plan", session_id, credits_purchased=0)
+                return
 
-            credits_to_add = int(
-                md.get("credits", 0)
-            )
+            res = purchase_plan("business", user_email, plan_name, stripe_session_id=session_id)
+            if res.get("ok"):
+                save_business_payment(user_email, amount_paid, "business_plan", session_id,
+                                      credits_purchased=res["credits"])
+                st.success(
+                    f"""
+                    🎉 Business Plan Activated Successfully
 
-            duration = md.get(
-                "duration",
-                "3 months"
-            )
+                    Plan: {plan_name}
 
-            from datetime import datetime, timedelta
-
-            if duration.lower() == "3 months":
-                expiry = datetime.now() + timedelta(days=90)
-
-            elif duration.lower() == "6 months":
-                expiry = datetime.now() + timedelta(days=180)
-
+                    Credits Added: {res['credits']}
+                    """
+                )
             else:
-                expiry = datetime.now() + timedelta(days=365)
-
-            activate_business_plan(
-                email=user_email,
-                plan_name=plan_name,
-                credits=credits_to_add,
-                expiry=expiry
-            )
-
-            save_business_payment(
-                user_email,
-                amount_paid,
-                "business_plan",
-                session_id,
-                credits_purchased=credits_to_add
-            )
-
-            st.success(
-                f"""
-                🎉 Business Plan Activated Successfully
-
-                Plan: {plan_name}
-
-                Credits Added: {credits_to_add}
-                """
-            )
+                save_business_payment(user_email, amount_paid, "business_plan", session_id, credits_purchased=0)
+                st.error(f"Could not activate business plan: {res.get('reason')}")
 
     except Exception as e:
         st.error(f"Stripe verification failed: {e}")
@@ -285,6 +264,7 @@ try:
     init_db()
     from database import seed_discount_codes
     seed_discount_codes()
+    backfill_wallets()
 except Exception as e:
     from database import get_db_config_summary
     cfg_summary = get_db_config_summary()
@@ -398,10 +378,6 @@ if 'cv_pdf_bytes' not in st.session_state:
 if 'cv_docx_bytes' not in st.session_state:
     st.session_state.cv_docx_bytes = None
 
-# Interview module session state
-from interview_module import _init_session as _init_interview_session
-_init_interview_session()
-
 
 def auto_save_progress():
     """Auto-save user progress"""
@@ -422,7 +398,9 @@ def main():
 
     if "portal" not in st.session_state:
         st.session_state.portal = "individual"
-    
+
+    # Interview module session state
+    _init_interview_session()
 
     # ✅ Show Register Page if user clicked register
     if st.session_state.page == "register":
@@ -474,7 +452,7 @@ def main():
             st.session_state.page = "home"   # any non-"billing" value works
             st.rerun()
         return
-    
+
     # Sidebar
     with st.sidebar:
         st.markdown(
@@ -486,9 +464,17 @@ def main():
 
         if st.session_state.get("account_type") == "business":
             credits = get_business_credits(email)
+            try:
+                credits = wallet_balance("business", email)["total"]
+            except Exception:
+                pass
             subscription = None
         else:
             credits = get_user_credits(email)
+            try:
+                credits = wallet_balance("individual", email)["total"]
+            except Exception:
+                pass
             subscription = check_subscription(email)
 
         # 🔹 Set AI model options based on subscription
@@ -624,7 +610,11 @@ def main():
                 - No personal info is shared with third parties  
                 """)
 
-    
+    # Full-page Interview Practice mode (entered from the CV optimization flow)
+    if st.session_state.get("page") == "interview":
+        _render_interview_full_page()
+        return
+
     # Main content
     tab1, tab3, tab4, tab5 = st.tabs(["🚀 Smart Job Match & Optimizer", "📊 Analytics", "💳 Billing", "🎤 Interview Practice"])
 
@@ -643,7 +633,6 @@ def main():
             deduct_credits_fn=deduct_user_credits,
             extract_resume_fn=extract_resume_text,
             export_qa_fn=export_interview_qa,
-            generate_qa_fn=generate_interview_qa,
         )
 
 def _render_job_results_unified(result, resume_text):
@@ -719,7 +708,7 @@ def _render_job_results_unified(result, resume_text):
                     if not resume_text:
                         st.warning("⚠️ Please upload your resume above before clicking Optimize.")
                     else:
-                        if not check_user_access(required_credits=3):
+                        if not check_user_access(required_credits=3, feature="CV"):
                             st.error("⚠️ Insufficient credits. You need 3 credits to run Gap Analysis & CV Optimization.")
                         else:
                             st.session_state.active_job_url = j_url
@@ -991,17 +980,21 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
             )
 
         if check_ats_btn:
-            if not check_user_access(required_credits=1):
-                st.error("⚠️ You need at least 1 credit to run ATS Check.")
-            elif not resume_text.strip():
+            if not resume_text.strip():
                 st.warning("⚠️ Could not extract text from your resume.")
             else:
                 try:
-                    with st.spinner("Analyzing baseline ATS score..."):
-                        analysis = analyze_cv_ats_score(resume_text, "")
-                    st.session_state["step1_ats_analysis"] = analysis
-                    deduct_user_credits(email, 1, feature="ATS")
-                    st.rerun()
+                    ats_result = ats_charge_or_free(
+                        _credit_account_type(), email, resume_text, "", feature="ATS"
+                    )
+                    if not ats_result.get("ok"):
+                        st.error("⚠️ You need at least 1 credit to run ATS Check.")
+                    else:
+                        with st.spinner("Analyzing baseline ATS score..."):
+                            analysis = analyze_cv_ats_score(resume_text, "")
+                        st.session_state["step1_ats_analysis"] = analysis
+                        st.session_state["last_ats_charged"] = ats_result.get("charged", 0)
+                        st.rerun()
                 except Exception as e:
                     st.error(f"❌ Error analyzing ATS score: {str(e)}")
 
@@ -1026,7 +1019,7 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
                         st.markdown(f"• {suggestion}")
 
         if ai_job_btn:
-            if not check_user_access(required_credits=1):
+            if not check_user_access(required_credits=1, feature="Job Match"):
                 st.error("⚠️ You need at least 1 credit to generate AI Recommendations.")
             elif not resume_text.strip():
                 st.warning("⚠️ Could not extract text from your resume.")
@@ -1113,8 +1106,7 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
         if not title.strip():
             st.warning("⚠️ Please enter a job title to search.")
         else:
-            credits = get_user_credits(email)
-            if credits < 1:
+            if not check_user_access(required_credits=1, feature="Job Search"):
                 st.warning("⚠️ You need at least 1 credit to search. Top up in the 💳 Billing tab.")
             else:
                 query = ja.SearchQuery(
@@ -1235,15 +1227,23 @@ def _show_manual_jd_mode(email: str):
                 if st.button("📊 Check ATS Score (1 credit)", key="manual_ats_score_btn", use_container_width=True):
                     if not st.session_state.manual_jd.strip() or not st.session_state.manual_title.strip():
                         st.error("❌ Please fill in the Target Job Title and Paste Job Description first.")
-                    elif not check_user_access(required_credits=1):
-                        st.error("⚠️ You need at least 1 credit to run ATS Check.")
                     else:
                         try:
-                            with st.spinner("Analyzing ATS score..."):
-                                analysis = analyze_cv_ats_score(resume_text, st.session_state.manual_jd)
-                            st.session_state.manual_ats_analysis = analysis
-                            deduct_user_credits(email, 1, feature="ATS")
-                            st.rerun()
+                            ats_result = ats_charge_or_free(
+                                _credit_account_type(),
+                                email,
+                                resume_text,
+                                st.session_state.manual_jd,
+                                feature="ATS",
+                            )
+                            if not ats_result.get("ok"):
+                                st.error("⚠️ You need at least 1 credit to run ATS Check.")
+                            else:
+                                with st.spinner("Analyzing ATS score..."):
+                                    analysis = analyze_cv_ats_score(resume_text, st.session_state.manual_jd)
+                                st.session_state.manual_ats_analysis = analysis
+                                st.session_state["last_ats_charged"] = ats_result.get("charged", 0)
+                                st.rerun()
                         except Exception as e:
                             st.error(f"❌ Error analyzing ATS score: {e}")
             
@@ -1251,7 +1251,7 @@ def _show_manual_jd_mode(email: str):
                 if st.button("⚡ Optimize CV (3 credits)", key="manual_optimize_btn", type="primary", use_container_width=True):
                     if not st.session_state.manual_jd.strip() or not st.session_state.manual_title.strip():
                         st.error("❌ Please fill in the Target Job Title and Paste Job Description first.")
-                    elif not check_user_access(required_credits=3):
+                    elif not check_user_access(required_credits=3, feature="CV"):
                         st.error("⚠️ You need at least 3 credits to optimize your CV.")
                     else:
                         with st.spinner("Analyzing CV & Job Description gaps..."):
@@ -1395,6 +1395,25 @@ def _show_manual_jd_mode(email: str):
         )
 
 
+def _render_interview_full_page():
+    """Full-page Interview Practice mode, entered from the CV optimization flow."""
+    st.markdown("---")
+    col_back, col_title = st.columns([1, 4])
+    with col_back:
+        if st.button("↩ Back to My Application", key="interview_back_to_suite", use_container_width=True):
+            st.session_state.page = "home"
+            st.rerun()
+    with col_title:
+        st.caption("Continuing from your optimized CV — practice interviews tailored to this job.")
+
+    show_interview_practice_page(
+        check_access_fn=check_user_access,
+        deduct_credits_fn=deduct_user_credits,
+        extract_resume_fn=extract_resume_text,
+        export_qa_fn=export_interview_qa,
+    )
+
+
 def _render_application_suite(email: str, resume_text: str, jd_to_use: str, title_disp: str, comp_disp: str):
     """Render Step 4: Your Tailored Application Suite - shared by both modes."""
     st.markdown("---")
@@ -1420,6 +1439,29 @@ def _render_application_suite(email: str, resume_text: str, jd_to_use: str, titl
             st.link_button("🚀 View / Apply on Source", active_url, use_container_width=True)
         else:
             st.button("🚀 View / Apply on Source", disabled=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # Continue into Interview Practice with this job's context
+    st.markdown("#### 🎤 Next Step: Practice Interview for This Job")
+    st.caption("Continue from your optimized CV to practice AI-led interview questions tailored to this job description.")
+    if st.button("🎤 Practice Interview for This Job", type="primary",
+                 key="continue_to_interview_btn", use_container_width=True):
+        incoming_jd = (jd_to_use or st.session_state.get("job_description", "") or "").strip().lower()
+        same_job = (st.session_state.get("interview_jd", "") or "").strip().lower() == incoming_jd \
+            and st.session_state.get("interview_qa_bank") is not None
+        if not same_job:
+            st.session_state.interview_qa_bank = None
+            st.session_state.interview_questions_flat = None
+            st.session_state.interview_session_results = []
+            st.session_state.interview_report = None
+            st.session_state.interview_current_idx = 0
+        st.session_state.interview_jd = jd_to_use or st.session_state.get("job_description", "")
+        st.session_state.interview_resume_text = st.session_state.get("cv_preview") or resume_text or ""
+        st.session_state.interview_phase = "setup"
+        st.session_state.interview_qa_content = None
+        st.session_state.page = "interview"
+        st.rerun()
 
     st.markdown("---")
 
@@ -1491,7 +1533,7 @@ def _render_application_suite(email: str, resume_text: str, jd_to_use: str, titl
     st.markdown("### 📝 Cover Letter")
     if not st.session_state.get("cover_letter_content"):
         if st.button("📝 Generate Cover Letter (2 credits)", key="gen_cover_letter_btn", type="primary"):
-            if not check_user_access(required_credits=2):
+            if not check_user_access(required_credits=2, feature="Cover Letter"):
                 st.error("⚠️ Insufficient credits. You need 2 credits to generate a Cover Letter.")
             else:
                 with st.spinner("Generating your tailored cover letter..."):
@@ -1909,8 +1951,16 @@ def show_analytics_page():
     success_rate = 0.0
     if st.session_state.get("account_type") == "business":
         credits_now = get_business_credits(user_email) or 0
+        try:
+            credits_now = wallet_balance("business", user_email)["total"]
+        except Exception:
+            pass
     else:
         credits_now = get_user_credits(user_email) or 0
+        try:
+            credits_now = wallet_balance("individual", user_email)["total"]
+        except Exception:
+            pass
 
     trend_dates, trend_scores = [], []
     conn, cur = None, None
@@ -2116,16 +2166,15 @@ def show_billing_page():
 
     # ---- Imports / setup ----
     import os, stripe, urllib.parse
-    from database import get_user_credits, save_payment, update_user_credits, get_db_connection
-    from payment import create_checkout_session, check_subscription, create_subscription
-
-    try:
-        from database import reset_credits_if_expired
-    except Exception:
-        def reset_credits_if_expired(email: str) -> bool: return False
+    from database import get_user_credits, save_payment, get_db_connection
+    from payment import create_checkout_session, check_subscription
 
     stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_default")
-    PLAN_CREDITS = {"Premium": 110, "Premium + Premium Classic": 125}
+    LEGACY_PLAN_MAP = {
+        "Premium": "Career Pro",
+        "Premium + Premium Classic": "Interview Pro",
+    }
+    PACK_CREDITS_TO_NAME = {p["credits"]: p["name"] for p in pricing.PACKS}
 
     def payment_exists(stripe_payment_id: str) -> bool:
         conn = get_db_connection()
@@ -2149,35 +2198,28 @@ def show_billing_page():
     if "processed_sessions" not in st.session_state:
         st.session_state.processed_sessions = set()
 
-    # ---- Handle CREDITS success ----
+    # ---- Handle CREDITS (pack) success ----
     if success and typ == "credits" and session_id and session_id not in st.session_state.processed_sessions:
         try:
             sess = stripe.checkout.Session.retrieve(session_id)
             if sess.get("payment_status") == "paid":
                 md = sess.get("metadata") or {}
-                credits_to_add = int(md.get("credits") or credits_qp or 0)
                 amount_paid = (sess.get("amount_total") or 0) / 100.0
+                pack_name = (md.get("pack") or "").strip()
+                if not pack_name:
+                    pack_credits = int(md.get("credits") or credits_qp or 0)
+                    pack_name = {p["credits"]: p["name"] for p in pricing.PACKS}.get(pack_credits)
 
-                sub_active = check_subscription(user_email)
-                if not sub_active:
-                    st.error("Top-ups require an active plan. Please purchase a plan first.")
-                else:
-                    try: reset_credits_if_expired(user_email)
-                    except Exception: pass
-
-                    if credits_to_add > 0 and not payment_exists(session_id):
-                        conn2 = get_db_connection(); cur2 = conn2.cursor()
-                        cur2.execute("""
-                            UPDATE users
-                               SET credits = COALESCE(credits, 0) + %s
-                             WHERE email=%s
-                        """, (credits_to_add, user_email))
-                        conn2.commit(); cur2.close(); conn2.close()
-
-                        save_payment(user_email, amount_paid, "credits", session_id, credits_purchased=credits_to_add)
-                        st.success(f"🎉 {credits_to_add} credits added to your current plan cycle.")
+                if not payment_exists(session_id) and pack_name:
+                    res = purchase_pack("individual", user_email, pack_name, stripe_session_id=session_id)
+                    if res.get("ok"):
+                        save_payment(user_email, amount_paid, "credits", session_id,
+                                     credits_purchased=res["credits"])
+                        st.success(f"🎉 {res['pack']} ({res['credits']} credits) added to your account.")
                     else:
-                        st.info("Payment already processed or no credits found.")
+                        st.error(f"Could not add pack: {res.get('reason')}")
+                else:
+                    st.info("Payment already processed or no pack found.")
             else:
                 st.warning("Payment not completed yet.")
         except Exception as e:
@@ -2207,64 +2249,49 @@ def show_billing_page():
 
                 plan_name = md.get("plan_name", "Starter")
 
-                credits_to_add = int(
-                    md.get("credits", 0)
-                )
-
-                duration = md.get(
-                    "duration",
-                    "3 Months"
-                )
-
                 amount_paid = (
                     sess.get("amount_total") or 0
                 ) / 100.0
 
                 # ==========================================
-                # PLAN EXPIRY
-                # ==========================================
-
-                from datetime import datetime, timedelta
-
-                if duration == "3 Months":
-                    expiry = datetime.now() + timedelta(days=90)
-
-                elif duration == "6 Months":
-                    expiry = datetime.now() + timedelta(days=180)
-
-                else:
-                    expiry = datetime.now() + timedelta(days=365)
-
-                # ==========================================
-                # ACTIVATE BUSINESS PLAN
+                # ACTIVATE BUSINESS PLAN VIA CREDIT ENGINE
                 # ==========================================
 
                 if not payment_exists(session_id):
 
-                    activate_business_plan(
-                        email=user_email,
-                        plan_name=plan_name,
-                        credits=credits_to_add,
-                        expiry=expiry
-                    )
-
-                    save_payment(
+                    res = purchase_plan(
+                        "business",
                         user_email,
-                        amount_paid,
-                        "business_plan",
-                        session_id,
-                        credits_purchased=credits_to_add
+                        plan_name,
+                        stripe_session_id=session_id
                     )
 
-                    st.success(
-                        f"""
-                        🎉 Business Plan Activated
+                    if res.get("ok"):
 
-                        Plan: {plan_name}
+                        save_payment(
+                            user_email,
+                            amount_paid,
+                            "business_plan",
+                            session_id,
+                            credits_purchased=res["credits"]
+                        )
 
-                        Credits Added: {credits_to_add}
-                        """
-                    )
+                        st.success(
+                            f"""
+                            🎉 Business Plan Activated
+
+                            Plan: {plan_name}
+
+                            Credits Added: {res['credits']}
+                            """
+                        )
+
+                    else:
+
+                        st.error(
+                            f"Could not activate business plan: "
+                            f"{res.get('reason')}"
+                        )
 
                 else:
 
@@ -2300,28 +2327,22 @@ def show_billing_page():
             sess = stripe.checkout.Session.retrieve(session_id)
             if sess.get("payment_status") == "paid":
                 md   = sess.get("metadata") or {}
-                plan = md.get("plan") or plan_qp or "Premium"
+                plan = md.get("plan") or plan_qp or "Career Pro"
+                plan = LEGACY_PLAN_MAP.get(plan, plan)
                 amount_paid = (sess.get("amount_total") or 0) / 100.0
                 if not payment_exists(session_id):
-                    create_subscription(user_email, plan, session_id)
-                    credits_to_add = PLAN_CREDITS.get(plan, 125)
+                    res = purchase_plan("individual", user_email, plan, stripe_session_id=session_id)
+                    if res.get("ok"):
+                        credits_to_add = res["credits"]
+                        save_payment(user_email, amount_paid, "subscription", session_id, credits_purchased=credits_to_add)
 
-                    conn2 = get_db_connection(); cur2 = conn2.cursor()
-                    cur2.execute("""
-                        UPDATE users
-                           SET credits = %s,
-                               credit_cycle_start = CURRENT_TIMESTAMP
-                         WHERE email=%s
-                    """, (credits_to_add, user_email))
-                    conn2.commit(); cur2.close(); conn2.close()
+                        # ✅ Log out and send to Pixel success hop (index.html handles redirect to login)
+                        st.session_state.pop("user_data", None)
+                        redirect_after_success_url = "https://cvolvepro.com/?trk=payment_success"
 
-                    save_payment(user_email, amount_paid, "subscription", session_id, credits_purchased=credits_to_add)
-
-                    # ✅ Log out and send to Pixel success hop (index.html handles redirect to login)
-                    st.session_state.pop("user_data", None)
-                    redirect_after_success_url = "https://cvolvepro.com/?trk=payment_success"
-
-                    st.success(f"🎉 {plan} active! {credits_to_add} credits added. Redirecting to login…")
+                        st.success(f"🎉 {plan} active! {credits_to_add} credits added. Redirecting to login…")
+                    else:
+                        st.error(f"Could not activate plan: {res.get('reason')}")
                 else:
                     st.info("Subscription payment already processed.")
             else:
@@ -2340,10 +2361,18 @@ def show_billing_page():
     # ---- Current status ----
     subscription = check_subscription(user_email)
     credits_now  = get_user_credits(user_email)
+    try:
+        bal = wallet_balance("individual", user_email)
+        credits_now = bal["total"]
+        pack_now = bal["pack_credits"]
+    except Exception:
+        pack_now = 0
     if subscription:
         st.success(f"✅ Current Plan: {subscription['plan']}")
         st.info(f"📅 Next billing: {subscription['next_billing']}")
     st.info(f"💎 Current Credits: {credits_now}")
+    if pack_now:
+        st.caption(f"🧩 Of which {pack_now} are pack credits (valid 90 days).")
 
     # Show cycle window (start → +30 days)
     try:
@@ -2406,37 +2435,19 @@ def show_billing_page():
                     """
                 )
 
+            business_prices = {
+                "Starter": 149, "Growth": 299, "Pro": 449, "Plus": 699, "Enterprise": 999,
+            }
+            _duration_label = lambda days: ("3 Months" if days <= 90
+                                            else ("6 Months" if days <= 180 else "1 Year"))
             business_plans = [
                 {
-                    "name": "Starter",
-                    "credits": 500,
-                    "price": 149,
-                    "duration": "3 Months"
-                },
-                {
-                    "name": "Growth",
-                    "credits": 1000,
-                    "price": 299,
-                    "duration": "3 Months"
-                },
-                {
-                    "name": "Pro",
-                    "credits": 2500,
-                    "price": 449,
-                    "duration": "6 Months"
-                },
-                {
-                    "name": "Plus",
-                    "credits": 5000,
-                    "price": 699,
-                    "duration": "6 Months"
-                },
-                {
-                    "name": "Enterprise",
-                    "credits": 10000,
-                    "price": 999,
-                    "duration": "1 Year"
+                    "name": name,
+                    "credits": cfg["credits"],
+                    "price": business_prices.get(name, 149),
+                    "duration": _duration_label(cfg["duration_days"]),
                 }
+                for name, cfg in pricing.CORPORATE_PLANS.items()
             ]
 
             for plan in business_plans:
@@ -2500,23 +2511,23 @@ def show_billing_page():
                 st.markdown("")
 
             st.stop()
-        st.markdown("#### 💎 Credit Packages")
-        subscription = check_subscription(user_email)  # ensure latest
-        credit_options = {"25 Credits": 5.99, "50 Credits": 7.99, "100 Credits": 10.99}
-
-        if not subscription:
-            st.info("Top-ups require an active plan. Purchase a plan on the right.")
-        else:
-            for label, price_usd in credit_options.items():
-                local_amount = price_local(price_usd)
-                if st.button(f"Buy {label} – {fmt(local_amount)}", key=f"buy_{label.replace(' ', '_')}"):
+        st.markdown("#### 💎 Credit Packs")
+        for pack in pricing.PACKS:
+            local_amount = price_local(pack["price_usd"])
+            with st.container(border=True):
+                st.markdown(f"### 🧩 {pack['name']}")
+                st.markdown(f"## {fmt(local_amount)}")
+                st.write(f"✅ {pack['credits']} AI Credits")
+                st.write(f"✅ Valid {pack['valid_days']} days")
+                if st.button(f"Buy {pack['name']}", key=f"buy_{pack['name'].replace(' ', '_')}"):
                     url = create_checkout_session(
                         user_email=user_email,
                         amount=local_amount,                     # local currency amount
                         payment_type="credits",
                         success_url=f"{base_url}?success=true&type=credits",
                         cancel_url=f"{base_url}?canceled=true",
-                        credits=int(label.split()[0]),
+                        credits=pack["credits"],
+                        pack=pack["name"],
                         currency=CURRENT_CURRENCY                # INR/EUR/USD/AED/BHD/AUD/GBP
                     )
                     if url:
@@ -2553,7 +2564,7 @@ def show_billing_page():
                 discount_pct = int(row["discount_percent"] or 0)
 
                 if dc == "PREMIUM599":
-                    coupon_msg.success("✅ Coupon applied: Premium for $5.99 with 50 credits")
+                    coupon_msg.success("✅ Coupon applied: Career Pro for $5.99")
                     st.session_state["active_coupon"] = {
                         "code": dc,
                         "discount_pct": 0,
@@ -2576,10 +2587,10 @@ def show_billing_page():
 
         if active_code == "PREMIUM599":
             st.markdown("### 🎉 Special Offer")
-            st.success("Premium subscription for $5.99 with 50 credits")
+            st.success("Career Pro subscription for $5.99")
 
-            if st.button("Buy Premium Promo – $5.99", key="buy_premium599"):
-                success_url = f"{base_url}?success=true&type=subscription&plan={urllib.parse.quote_plus('Premium')}"
+            if st.button("Buy Career Pro Promo – $5.99", key="buy_premium599"):
+                success_url = f"{base_url}?success=true&type=subscription&plan={urllib.parse.quote_plus('Career Pro')}"
                 cancel_url  = f"{base_url}?canceled=true"
 
                 session_url = create_checkout_session(
@@ -2588,8 +2599,7 @@ def show_billing_page():
                     payment_type="subscription",
                     success_url=success_url,
                     cancel_url=cancel_url,
-                    plan="Premium",
-                    credits=50,
+                    plan="Career Pro",
                     currency="USD"
                 )
 
@@ -2601,11 +2611,11 @@ def show_billing_page():
                 )
                 st.stop()
 
-        subscription_options = {"Premium": 24.99, "Premium + Premium Classic": 29.99}
         phone = (st.session_state.get("user_data", {}).get("phone") or "").strip()
         is_india_user = phone.startswith("+91")
 
-        for plan_name, price_usd in subscription_options.items():
+        for plan_name, cfg in pricing.PLANS.items():
+            price_usd = cfg["price_usd"]
 
             special_discount = get_user_special_discount(
                 user_email,
@@ -2617,9 +2627,9 @@ def show_billing_page():
                 special_discount
             )
 
-            if is_india_user and plan_name == "Premium":
+            if is_india_user:
 
-                base_local = 2099
+                base_local = cfg["price_inr"]
 
                 final_local = round(
                     base_local * (1 - effective_discount / 100.0)
@@ -2647,14 +2657,15 @@ def show_billing_page():
                             else f"{plan_name} – {fmt(base_local)}"):
 
                 st.markdown("✅ Premium AI Model")
-                if "Classic" in plan_name:
-                    st.markdown("✅ Premium Classic AI Model")
-                st.markdown(f"✅ {PLAN_CREDITS.get(plan_name, 125)} Credits")
+                st.markdown(f"✅ {cfg['monthly_credits']} Credits / month")
                 st.markdown("✅ ATS Score Checker")
                 st.markdown("✅ CV Generator")
                 st.markdown("✅ CL Generator")
-                if "Classic" in plan_name:
-                    st.markdown("✅ Interview Q&A")
+                st.markdown("✅ Interview Q&A")
+                if cfg.get("f2f"):
+                    st.markdown(f"✅ Live F2F Mock Interview (up to {cfg['f2f_max_minutes']} min)")
+                else:
+                    st.markdown("❌ Live F2F Mock Interview (Interview Pro only)")
 
                 if effective_discount:
 
@@ -2679,7 +2690,7 @@ def show_billing_page():
                     
                     session_url = create_checkout_session(
                         user_email=user_email,
-                        amount=final_local,              # ✅ ₹899 or converted value
+                        amount=final_local,              # ✅ ₹699 / ₹1499 or converted value
                         payment_type="subscription",
                         success_url=success_url,
                         cancel_url=cancel_url,
@@ -2832,34 +2843,23 @@ def analyze_ats_compatibility():
             for keyword in metadata["unsupported_gaps"][:5]:
                 st.markdown(f"• {keyword}")
 
-def check_user_access(required_credits=2):
+def _credit_account_type():
+    return "business" if st.session_state.get("account_type") == "business" else "individual"
+
+
+def check_user_access(required_credits=2, feature=None):
     email = st.session_state.user_data['email']
     if email and ("tester@cvolvepro.com" in email.lower() or "test" in email.lower()):
         return True
-
-    if st.session_state.get("account_type") == "business":
-
-        return (
-            get_business_credits(email)
-            >= required_credits
-        )
-
-    # Individual users
-
+    account_type = "business" if st.session_state.get("account_type") == "business" else "individual"
     try:
-        reset_credits_if_expired(email)
+        return has_enough(account_type, email, amount=required_credits, feature=feature)
     except Exception:
-        pass
-
-    return (
-        get_user_credits(email)
-        >= required_credits
-    )
+        return False
 
 
 def deduct_user_credits(email, amount, feature=None):
-    """Deduct credits for individual or business users."""
-
+    """Deduct credits for individual or business users via the credit engine."""
     try:
         # Test accounts receive free/unlimited credits without deduction
         if email and ("tester@cvolvepro.com" in email.lower() or "test" in email.lower()):
@@ -2870,106 +2870,33 @@ def deduct_user_credits(email, amount, feature=None):
                     pass
             return True
 
-        # =====================================================
-        # BUSINESS USERS
-        # =====================================================
-
-        if st.session_state.get("account_type") == "business":
-
-            current = get_business_credits(email)
-
-            if current < amount:
-
-                st.warning(
-                    "You don’t have enough business credits to complete this action."
-                )
-
-                return False
-
-            update_business_credits(
-                email,
-                current - amount
-            )
-
-            if (
-                feature
-                and st.session_state.get("account_type") != "business"
-            ):
+        account_type = "business" if st.session_state.get("account_type") == "business" else "individual"
+        result = spend_credits(
+            account_type,
+            email,
+            feature or "general",
+            amount=amount,
+        )
+        if result.get("ok"):
+            if feature:
                 try:
-                    record_credit_usage(
-                        email,
-                        feature,
-                        amount
-                    )
-                except Exception as log_err:
-                    st.warning(
-                        f"Credit usage log failed: {log_err}"
-                    )
-
+                    record_credit_usage(email, feature, amount)
+                except Exception:
+                    pass
+            st.session_state["last_credit_activity"] = {
+                "feature": feature or "general",
+                "amount": amount,
+                "timestamp": time.time(),
+            }
             return True
 
-        # =====================================================
-        # INDIVIDUAL USERS
-        # =====================================================
-
-        try:
-            reset_credits_if_expired(email)
-        except Exception:
-            pass
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        cur.execute("""
-            UPDATE users
-               SET credits = COALESCE(credits, 0) - %s
-             WHERE email=%s
-               AND COALESCE(credits, 0) >= %s
-        """, (
-            amount,
-            email,
-            amount
-        ))
-
-        conn.commit()
-
-        ok = cur.rowcount > 0
-
-        cur.close()
-        conn.close()
-
-        if not ok:
-
-            st.warning(
-                "You don’t have enough credits to complete this action."
-            )
-
-            return False
-
-        if feature:
-
-            try:
-
-                record_credit_usage(
-                    email,
-                    feature,
-                    amount
-                )
-
-            except Exception as log_err:
-
-                st.warning(
-                    f"Credit usage log failed: {log_err}"
-                )
-
-        return True
+        st.warning("You don’t have enough credits to complete this action.")
+        return False
 
     except Exception as e:
-
         st.error(
             f"Error deducting credits: {str(e)}"
         )
-
         return False
 
 
@@ -2991,100 +2918,6 @@ def add_bottom_border(paragraph):
     bottom.set(qn('w:color'), 'auto')
     borders.append(bottom)
     pPr.append(borders)
-
-def show_interview_qa_page():
-    st.markdown("## 🤖 Interview Preparation Q&A")
-    st.markdown("Generate personalized interview questions and answers by entering a Job Description and uploading a Resume here (independent of Tab 1).")
-
-    # ✅ JD Input for Tab 2
-    jd_tab2 = st.text_area(
-        "📋 Enter Job Description",
-        height=200,
-        placeholder="Paste the job description for which you want to generate interview Q&A",
-        key="jd_tab2_input"
-    )
-
-    # ✅ Clear JD Button
-    def clear_jd_tab2():
-        st.session_state.jd_tab2_input = ""
-
-    st.button("🧹 Clear JD", help="Click to clear job description", on_click=clear_jd_tab2, key="clear_jd_tab2")
-
-    # ✅ Resume Upload for Tab 2
-    uploaded_resume_tab2 = st.file_uploader(
-        "📄 Upload your Resume (PDF/DOCX)",
-        type=["pdf", "docx"],
-        help="Upload the resume you want to use for Q&A generation",
-        key="resume_tab2_upload"
-    )
-
-    # ✅ Previews
-    if jd_tab2.strip():
-        with st.expander("📝 Job Description Preview"):
-            st.code(jd_tab2, language="markdown")
-
-    if uploaded_resume_tab2:
-        resume_text_preview = extract_resume_text(uploaded_resume_tab2)
-        with st.expander("📄 Resume Preview"):
-            st.text_area("Resume Content", resume_text_preview[:2000], height=300, disabled=True)
-
-    # ✅ Generate Q&A Button
-    if jd_tab2.strip() and uploaded_resume_tab2:
-        if st.button("🎤 Generate Interview Q&A", key="generate_qa_tab2"):
-            loading_placeholder = st.empty()
-            loading_placeholder.markdown("""
-                <div style="display: flex; flex-direction: column; align-items: center; padding: 20px;">
-                    <div class="custom-loader"></div>
-                    <p style="margin-top: 10px; font-weight:bold; font-size:16px;">⏳ Generating interview Q&A... Please wait</p>
-                </div>
-            """, unsafe_allow_html=True)
-
-            try:
-                # Extract resume text
-                resume_text_tab2 = extract_resume_text(uploaded_resume_tab2)
-
-                # Generate Q&A
-                qa_content = generate_interview_qa(resume_text_tab2, jd_tab2)
-
-                loading_placeholder.empty()
-
-                # ✅ Display Q&A
-                st.markdown("### 📌 Suggested Questions & Answers")
-                st.markdown(qa_content)
-
-                # ✅ Export Options
-                pdf_buffer, docx_buffer = export_interview_qa(qa_content)
-
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        "📥 Download PDF",
-                        data=pdf_buffer,
-                        file_name="interview_QA.pdf",
-                        mime="application/pdf",
-                        key="download_pdf_tab2"
-                    )
-                with col2:
-                    st.download_button(
-                        "📥 Download DOCX",
-                        data=docx_buffer,
-                        file_name="interview_QA.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="download_docx_tab2"
-                    )
-
-                # ✅ Deduct credits
-                deduct_user_credits(st.session_state.user_data['email'], 3, feature="Interview QA")
-
-            except Exception as e:
-                loading_placeholder.empty()
-                st.error(f"❌ Error generating Q&A: {str(e)}")
-
-    else:
-        st.warning("Please provide both Job Description and Resume above to proceed.")
-
-
-
 
 def send_otp_email(email: str, otp: str) -> bool:
     """Send a 6-digit OTP via Resend."""

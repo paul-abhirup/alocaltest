@@ -346,3 +346,148 @@
         transition-duration: 0.01ms !important;
     }
 }
+
+/* ============================================================================
+   Interview Module Design System Extension
+   Matches the CVOLVE PRO Reverted Gold/Orange + Pastel Animated Theme
+   ============================================================================ */
+
+.interview-header {
+    background: linear-gradient(135deg, #FFD700 0%, #FF8C00 100%);
+    color: #1e293b;
+    padding: 1.75rem 2rem;
+    border-radius: var(--radius);
+    margin-bottom: 1.5rem;
+    text-align: center;
+    box-shadow: var(--shadow-md);
+}
+
+.interview-header h1, .interview-header h2 {
+    margin: 0 0 0.35rem 0;
+    color: #1e293b !important;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+}
+
+.interview-header p {
+    margin: 0;
+    color: #1e293b !important;
+    font-size: 1rem;
+    opacity: 0.95;
+    font-weight: 500;
+}
+
+.interview-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1rem;
+    box-shadow: var(--shadow);
+    transition: box-shadow 0.15s ease;
+}
+.interview-card:hover {
+    box-shadow: var(--shadow-md);
+}
+
+.interview-card-accent {
+    border-left: 5px solid var(--primary);
+}
+
+.interview-credit-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.1rem 1rem;
+    text-align: center;
+    box-shadow: var(--shadow);
+    transition: border-color 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease;
+}
+.interview-credit-card:hover {
+    border-color: var(--primary);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+}
+
+.interview-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.interview-badge-primary {
+    background: var(--primary-tint);
+    color: var(--primary);
+    border: 1px solid rgba(255, 140, 0, 0.3);
+}
+
+.interview-badge-neutral {
+    background: var(--surface-2);
+    color: #334155;
+    border: 1px solid var(--border);
+}
+
+.interview-badge-success {
+    background: #ecfdf5;
+    color: #047857;
+    border: 1px solid #a7f3d0;
+}
+
+.interview-badge-warning {
+    background: #fffbeb;
+    color: #b45309;
+    border: 1px solid #fde68a;
+}
+
+.interview-badge-danger {
+    background: #fef2f2;
+    color: #b91c1c;
+    border: 1px solid #fecaca;
+}
+
+.interview-progress-wrap {
+    margin-top: 14px;
+    background: rgba(30, 41, 59, 0.12);
+    border-radius: 8px;
+    height: 10px;
+    overflow: hidden;
+}
+
+.interview-progress-fill {
+    background: linear-gradient(90deg, #1e293b, #475569);
+    height: 10px;
+    border-radius: 8px;
+    transition: width 0.4s ease;
+}
+
+.interview-score-banner {
+    background: linear-gradient(135deg, #FFD700 0%, #FF8C00 100%);
+    border-radius: var(--radius);
+    padding: 2rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    box-shadow: var(--shadow-md);
+}
+
+.interview-score-num {
+    color: #1e293b;
+    font-size: 3.5rem;
+    font-weight: 800;
+    line-height: 1;
+    margin: 0;
+}
+
+.interview-score-band {
+    display: inline-block;
+    background: #ffffff;
+    padding: 4px 18px;
+    border-radius: 20px;
+    font-size: 1.25rem;
+    font-weight: 800;
+    margin: 10px 0;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+}
+

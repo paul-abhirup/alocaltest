@@ -138,6 +138,7 @@ from database import (
 import cv_generator
 from templates import apply_template
 from utils import enforce_page_limit
+from credit_engine import has_enough, spend_credits, wallet_balance
 
 # Config (env-first)
 JWT_SECRET = os.getenv("JWT_SECRET", os.getenv("FLASK_SECRET", "please_change_me_in_prod"))
@@ -1000,14 +1001,19 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
         raise HTTPException(status_code=401, detail="Invalid token")
 
     # 2) credits check
-    credits_now = None
     try:
-        credits_now = get_user_credits(user_email)
+        if not has_enough("individual", user_email, amount=CV_CREDIT_COST, feature="CV"):
+            raise HTTPException(status_code=402, detail="Insufficient credits")
+    except HTTPException:
+        raise
     except Exception:
         credits_now = None
-
-    if credits_now is not None and credits_now < CV_CREDIT_COST:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
+        try:
+            credits_now = get_user_credits(user_email)
+        except Exception:
+            credits_now = None
+        if credits_now is not None and credits_now < CV_CREDIT_COST:
+            raise HTTPException(status_code=402, detail="Insufficient credits")
 
     # 3) validate input
     if not req.job_description or not req.job_description.strip():
@@ -1284,7 +1290,7 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
         raise HTTPException(status_code=500, detail="Failed to encode generated file")
 
     try:
-        update_user_credits(user_email, -CV_CREDIT_COST)
+        spend_credits("individual", user_email, "CV", amount=CV_CREDIT_COST)
     except Exception:
         traceback.print_exc()
 
@@ -1304,9 +1310,12 @@ async def api_generate_cv(req: GenerateCVRequest, Authorization: Optional[str] =
 
     updated_credits = None
     try:
-        updated_credits = get_user_credits(user_email)
+        updated_credits = wallet_balance("individual", user_email)["total"]
     except Exception:
-        updated_credits = None
+        try:
+            updated_credits = get_user_credits(user_email)
+        except Exception:
+            updated_credits = None
 
     meta_payload = {
         "measured_ats_score": cv_metadata.get("ats_score"),
@@ -1369,13 +1378,19 @@ async def api_cv_jd_gaps(req: CVJDGapRequest, Authorization: Optional[str] = Hea
         raise HTTPException(status_code=401, detail="Invalid token")
 
     # 2) Credits check — gap analysis costs 1 credit
-    credits_now = None
     try:
-        credits_now = get_user_credits(user_email)
+        if not has_enough("individual", user_email, amount=1, feature="CV"):
+            raise HTTPException(status_code=402, detail="Insufficient credits (need ≥1 for gap analysis)")
+    except HTTPException:
+        raise
     except Exception:
         credits_now = None
-    if credits_now is not None and credits_now < 1:
-        raise HTTPException(status_code=402, detail="Insufficient credits (need ≥1 for gap analysis)")
+        try:
+            credits_now = get_user_credits(user_email)
+        except Exception:
+            credits_now = None
+        if credits_now is not None and credits_now < 1:
+            raise HTTPException(status_code=402, detail="Insufficient credits (need ≥1 for gap analysis)")
 
     # 3) Validate JD
     if not req.job_description or not req.job_description.strip():
@@ -1408,16 +1423,19 @@ async def api_cv_jd_gaps(req: CVJDGapRequest, Authorization: Optional[str] = Hea
 
     # 6) Deduct 1 credit
     try:
-        update_user_credits(user_email, -1)
+        spend_credits("individual", user_email, "CV", amount=1)
     except Exception:
         traceback.print_exc()
 
     # 7) Return result
     updated_credits = None
     try:
-        updated_credits = get_user_credits(user_email)
+        updated_credits = wallet_balance("individual", user_email)["total"]
     except Exception:
-        pass
+        try:
+            updated_credits = get_user_credits(user_email)
+        except Exception:
+            pass
 
     jd_hash = hash_jd(req.job_description)
 
@@ -1871,15 +1889,18 @@ async def api_generate_cl(req: GenerateCLRequest, Authorization: Optional[str] =
             cl_text_structured = cl_text_raw
 
     try:
-        update_user_credits(user_email, -2)
+        spend_credits("individual", user_email, "Cover Letter", amount=2)
     except Exception:
         traceback.print_exc()
 
     current_credits = None
     try:
-        current_credits = get_user_credits(user_email)
+        current_credits = wallet_balance("individual", user_email)["total"]
     except Exception:
-        current_credits = None
+        try:
+            current_credits = get_user_credits(user_email)
+        except Exception:
+            current_credits = None
 
     # --- Try to produce a real .docx for the cover letter (best-effort) ---
     docx_b64 = None

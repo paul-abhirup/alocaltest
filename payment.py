@@ -12,7 +12,6 @@ except ModuleNotFoundError:
 from database import (
     get_db_connection,
     save_payment,
-    update_user_credits,
     validate_discount_code,
     use_discount_code,
     payment_exists,
@@ -124,7 +123,8 @@ def get_stripe_public_key():
     return os.getenv("STRIPE_PUBLIC_KEY", "pk_test_default")
 
 def create_checkout_session(user_email, amount, payment_type, success_url, cancel_url,
-                            plan=None, credits=None, currency="USD", plan_name=None, duration=None):
+                            plan=None, credits=None, currency="USD", plan_name=None, duration=None,
+                            pack=None):
     """
     Create a Stripe Checkout Session charging in the caller's local currency.
     Handles minor units correctly (e.g., BHD = 3 decimals).
@@ -154,6 +154,9 @@ def create_checkout_session(user_email, amount, payment_type, success_url, cance
 
         if duration:
             md['duration'] = duration
+
+        if pack:
+            md['pack'] = pack
 
         cur = (currency or "USD").upper()
         mult = _multiplier_for(cur)

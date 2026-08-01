@@ -4,10 +4,13 @@
 !.env.example
 .streamlit/secrets.toml
 # Recovery notes/exports may contain live prod keys — never commit
-# docs/*.pdf
-# docs/**/secrets*
-# docs/
-# scripts/
+docs/*.pdf
+docs/**/secrets*
+docs/
+scripts/
+
+resume/
+scripts/
 
 # Python
 .venv/

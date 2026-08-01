@@ -1,4 +1,5 @@
 import os
+import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool
@@ -14,6 +15,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Fixed key so all app instances serialize schema migrations through the same
+# advisory lock (avoids cross-process deadlocks between concurrent init_db runs
+# and between DDL and in-flight queries).
+_INIT_DB_ADVISORY_KEY = 825379421
 
 # Connection pool
 _connection_pool = None
@@ -211,10 +217,25 @@ def get_db_connection():
 
     return psycopg2.connect(**conn_kwargs)
 
-def init_db():
-    """Initialize database tables"""
+def _init_db_once():
+    """Initialize database tables.
+
+    Runs under a cross-process advisory lock with a bounded lock_timeout so that
+    concurrent app starts (or a start overlapping in-flight queries) serialize
+    instead of deadlocking on AccessExclusiveLock vs AccessShareLock.
+    """
     conn = get_db_connection()
+    conn.rollback()  # clear any stale transaction state from a pooled connection
     cursor = conn.cursor()
+
+    # Bound how long DDL waits for a conflicting runtime lock, then retry
+    # (init_db) instead of letting the server raise a deadlock.
+    try:
+        cursor.execute("SET LOCAL lock_timeout = '20000'")
+    except Exception:
+        pass
+    # Serialize DDL across all app instances / processes.
+    cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_INIT_DB_ADVISORY_KEY,))
 
 
     # =========================================================
@@ -243,6 +264,15 @@ def init_db():
 
             is_active BOOLEAN DEFAULT TRUE
         )
+    """)
+    # Active business plan tracking (may predate this migration on prod)
+    cursor.execute("""
+        ALTER TABLE business_users
+        ADD COLUMN IF NOT EXISTS current_plan VARCHAR(100)
+    """)
+    cursor.execute("""
+        ALTER TABLE business_users
+        ADD COLUMN IF NOT EXISTS plan_expiry TIMESTAMP
     """)
 
     # =========================================================
@@ -430,6 +460,123 @@ def init_db():
         ADD COLUMN IF NOT EXISTS credit_cycle_start TIMESTAMP
     """)
 
+    # =========================================================
+    # CREDIT ENGINE TABLES (plans, packs, ledger)
+    # =========================================================
+
+    # Wallet = single source of truth for credit balances per account.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS credit_wallets (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',  -- individual | business
+            email VARCHAR(255) NOT NULL,
+            plan VARCHAR(50) DEFAULT 'Free',
+            subscription_credits INTEGER DEFAULT 0,
+            pack_credits INTEGER DEFAULT 0,
+            cycle_start TIMESTAMP,
+            next_renewal TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (account_type, email)
+        )
+    """)
+
+    # Immutable ledger of every credit movement.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS credit_transactions (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            email VARCHAR(255) NOT NULL,
+            feature VARCHAR(80),
+            amount INTEGER NOT NULL,            -- signed delta
+            txn_type VARCHAR(30) NOT NULL,      -- charge|refund|plan_purchase|pack_purchase|expire|renewal|credit
+            source VARCHAR(20),                 -- subscription | pack | free | gift
+            pack_id INTEGER,                    -- pack debited (for pack-source charges)
+            balance_after INTEGER NOT NULL DEFAULT 0,
+            request_id VARCHAR(64),
+            idempotency_key VARCHAR(128),
+            group_id VARCHAR(64),
+            reference_txn_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Newer column added after initial migration (safe on fresh + existing DBs).
+    cursor.execute("ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS group_id VARCHAR(64)")
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS ix_credit_tx_group
+        ON credit_transactions(group_id) WHERE group_id IS NOT NULL
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_tx_request
+        ON credit_transactions(request_id) WHERE request_id IS NOT NULL
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_tx_idem
+        ON credit_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS ix_credit_tx_account
+        ON credit_transactions(account_type, email, created_at DESC)
+    """)
+
+    # Individual purchased credit packs (90-day validity).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS credit_packs (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            email VARCHAR(255) NOT NULL,
+            pack_name VARCHAR(100) NOT NULL,
+            credits INTEGER NOT NULL,
+            credits_remaining INTEGER NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            stripe_session_id VARCHAR(255),
+            purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ATS hash-pair history → free rechecks for an identical CV+JD pair.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ats_checks (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            email VARCHAR(255) NOT NULL,
+            cv_hash VARCHAR(64) NOT NULL,
+            jd_hash VARCHAR(64) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (account_type, email, cv_hash, jd_hash)
+        )
+    """)
+
+    # Free-plan usage counters (reset monthly).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS free_usage_counters (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            email VARCHAR(255) NOT NULL,
+            feature VARCHAR(50) NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            period_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (account_type, email, feature, period_start)
+        )
+    """)
+
+    # Live F2F mock-interview sessions (incremental block billing).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS f2f_sessions (
+            id SERIAL PRIMARY KEY,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            email VARCHAR(255) NOT NULL,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            blocks_charged INTEGER NOT NULL DEFAULT 0,
+            blocks_charged_minutes INTEGER NOT NULL DEFAULT 0,
+            status VARCHAR(20) DEFAULT 'active',  -- active | ended | refunded
+            is_free BOOLEAN DEFAULT FALSE,        -- free-plan one-time 3-min voice interview
+            max_minutes INTEGER DEFAULT 0,        -- session cap (0 = unlimited)
+            last_charge_txn_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 
 
@@ -437,6 +584,35 @@ def init_db():
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def init_db(retries: int = 5, base_delay: float = 1.0):
+    """Initialize database tables, retrying transient lock/deadlock errors.
+
+    A single DDL statement (ALTER TABLE / CREATE INDEX) takes an
+    AccessExclusiveLock; if it overlaps an in-flight query that holds locks on
+    another table, PostgreSQL may abort one side with 'deadlock detected'. We
+    retry the migration a few times so a transient overlap does not fail startup.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            _init_db_once()
+            return
+        except psycopg2.OperationalError as e:
+            last_err = e
+            # 40P01 = deadlock_detected, 55P03 = lock_not_available
+            if e.pgcode not in ("40P01", "55P03"):
+                raise
+            delay = base_delay * (attempt + 1)
+            logger.warning(
+                "init_db transient lock error (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1, retries, e, delay,
+            )
+            time.sleep(delay)
+    if last_err is not None:
+        raise last_err
+
 
 def get_user_data(email):
     """Get user data by email"""
@@ -496,6 +672,8 @@ def create_business_user(
 
     credits, duration = plans[plan_name]
 
+    duration_days = {"3 months": 90, "6 months": 180}.get(duration.lower(), 365)
+
     cursor.execute("""
         INSERT INTO business_users (
             company_name,
@@ -504,9 +682,12 @@ def create_business_user(
             password_hash,
             plan_name,
             credits,
-            subscription_duration
+            subscription_duration,
+            current_plan,
+            plan_expiry
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
+                CURRENT_TIMESTAMP + %s * INTERVAL '1 day')
     """, (
         company_name,
         owner_name,
@@ -514,8 +695,20 @@ def create_business_user(
         password_hash,
         plan_name,
         credits,
-        duration
+        duration,
+        plan_name,
+        duration_days,
     ))
+
+    # Seed the credit-engine wallet so balance displays consistently.
+    cursor.execute("""
+        INSERT INTO credit_wallets
+            (account_type, email, plan, subscription_credits, pack_credits,
+             cycle_start, next_renewal)
+        VALUES ('business', %s, %s, %s, 0, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP + %s * INTERVAL '1 day')
+        ON CONFLICT (account_type, email) DO NOTHING
+    """, (email, plan_name, credits, duration_days))
 
     conn.commit()
     cursor.close()

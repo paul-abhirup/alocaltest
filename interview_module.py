@@ -13,6 +13,7 @@ import streamlit as st
 import json
 import re
 import os
+import time
 from io import BytesIO
 from datetime import datetime
 
@@ -20,6 +21,15 @@ import google.generativeai as genai
 import openai
 from streamlit import session_state as st_session
 from tts_utils import tts_component_html
+
+from credit_engine import (
+    can_use_f2f,
+    start_f2f_session,
+    charge_f2f_block,
+    refund_f2f_block,
+    end_f2f_session,
+)
+import pricing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini model (shared with cv_generator)
@@ -121,8 +131,8 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                 ],
             }
             pool = tech_templates.get(diff, tech_templates["medium"])
-            for phrase in jd_phrases[:12]:
-                t = pool[rng % len(pool)].format(phrase)
+            for i, phrase in enumerate(jd_phrases[:12]):
+                t = pool[(rng + i) % len(pool)].format(phrase)
                 if t not in seen_questions:
                     seen_questions.add(t)
                     demo_questions.append({
@@ -220,32 +230,31 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                         "key_points": ["Career narrative", "Self-awareness", "Growth mindset", "Relevant experience", "Role alignment"],
                     })
 
-        # Fill remaining slots if needed (shouldn't happen with 15+ questions, but safe)
-        fillers = {
-            "easy": [
-                "What motivates you to do your best work?",
-                "Describe a skill you are currently developing.",
-            ],
-            "medium": [
-                "How do you stay updated with trends in your field?",
-                "Describe your approach to continuous professional development.",
-            ],
-            "hard": [
-                "Describe a project you are proud of and the key decisions you made.",
-                "How would you approach building something from scratch in this role?",
-            ],
-        }
-        filler_pool = fillers.get(diff, fillers["medium"])
-        for q_text in filler_pool:
-            if len(demo_questions) >= needed_total:
-                break
+        # Guarantee the advertised question count by padding with generic questions.
+        generic_fillers = [
+            "What motivates you to do your best work?",
+            "Describe a skill you are currently developing.",
+            "How do you stay updated with trends in your field?",
+            "Describe your approach to continuous professional development.",
+            "Describe a project you are proud of and the key decisions you made.",
+            "How would you approach building something from scratch in this role?",
+            "Tell me about a goal you set for yourself and how you achieved it.",
+            "Describe a time you had to learn something new quickly to get a job done.",
+            "How do you prioritize your work when everything is urgent?",
+            "Describe a time you had to make a difficult choice with limited information.",
+        ]
+        generic_kp = ["Self-awareness", "Continuous learning", "Growth mindset", "Problem-solving", "Communication"]
+        filler_i = 0
+        while len(demo_questions) < needed_total and filler_i < 100:
+            q_text = generic_fillers[filler_i % len(generic_fillers)]
+            filler_i += 1
             if q_text not in seen_questions:
                 seen_questions.add(q_text)
                 demo_questions.append({
                     "question": q_text,
                     "difficulty": diff,
-                    "ideal_answer": "I stay current through continuous learning, industry publications, and hands-on projects. I actively seek feedback and apply it to improve.",
-                    "key_points": ["Continuous learning", "Self-improvement", "Industry awareness", "Practical application", "Growth mindset"],
+                    "ideal_answer": "I approach this by focusing on clear communication, empathy, and results. I believe in understanding the situation fully before acting, and I always follow up to ensure positive outcomes.",
+                    "key_points": generic_kp,
                 })
 
         import random as _random
@@ -516,7 +525,7 @@ def _ai_call(prompt: str, json_mode: bool = False) -> str:
     if groq_key:
         try:
             import httpx as _httpx
-            groq_model = os.getenv("GROQ_MODEL") or "llama3-70b-8192"
+            groq_model = os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile"
             groq_payload = {
                 "model": groq_model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -1328,7 +1337,7 @@ def export_feedback_report(report: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Main Streamlit UI — show_interview_practice_page()
 # ─────────────────────────────────────────────────────────────────────────────
-def show_interview_practice_page(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn, generate_qa_fn):
+def show_interview_practice_page(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn):
     """
     Main entry point called from app.py.
     Passes down helper functions to avoid circular imports.
@@ -1339,9 +1348,11 @@ def show_interview_practice_page(check_access_fn, deduct_credits_fn, extract_res
     phase = st.session_state.get("interview_phase", "setup")
 
     if phase == "setup":
-        _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn, generate_qa_fn)
+        _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn)
     elif phase == "session":
         _phase_session()
+    elif phase == "f2f":
+        _phase_f2f(export_qa_fn)
     elif phase == "report":
         _phase_report()
 
@@ -1363,6 +1374,17 @@ def _init_session():
         "interview_show_feedback": False,
         "interview_last_evaluation": None,
         "interview_last_answer": "",
+        # F2F (live voice) interview
+        "f2f_session_id": None,
+        "f2f_is_free": False,
+        "f2f_max_minutes": 0,
+        "f2f_questions": [],
+        "f2f_idx": 0,
+        "f2f_start_ts": None,
+        "f2f_blocks_charged": 0,
+        "f2f_results": [],
+        "f2f_status": "",
+        "f2f_notice": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1372,33 +1394,29 @@ def _init_session():
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 1: Setup
 # ─────────────────────────────────────────────────────────────────────────────
-def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn, generate_qa_fn):
+def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_qa_fn):
 
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-                border-radius: 16px; padding: 30px; margin-bottom: 24px;">
-        <h1 style="color:#e94560; margin:0; font-size:32px;">🤖 AI Interview Practice</h1>
-        <p style="color:#a0b4d6; margin:8px 0 0; font-size:16px;">
-            A real-time interview simulation powered by AI — generate questions, practice answers,
-            and receive a detailed performance report.
-        </p>
+    <div class="interview-header">
+        <h1 style="display:inline-block; vertical-align:middle; margin:0;">🤖 AI Interview Practice</h1>
+        <p>A real-time interview simulation powered by AI — generate questions, practice answers, and receive a detailed performance report.</p>
     </div>
     """, unsafe_allow_html=True)
 
     # ─── Credit Info Banner ───────────────────────────────────────────────────
     col_c1, col_c2, col_c3 = st.columns(3)
     with col_c1:
-        st.markdown("""<div style="background:#fff3cd;border-radius:10px;padding:14px;text-align:center">
-            <div style="font-size:22px;font-weight:700;color:#856404">5 Credits</div>
-            <div style="color:#856404;font-size:13px">15-minute session</div></div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="interview-credit-card">
+            <div class="interview-credit-value">5 Credits</div>
+            <div class="interview-credit-sub">15-minute session</div></div>""", unsafe_allow_html=True)
     with col_c2:
-        st.markdown("""<div style="background:#d1ecf1;border-radius:10px;padding:14px;text-align:center">
-            <div style="font-size:22px;font-weight:700;color:#0c5460">8 Credits</div>
-            <div style="color:#0c5460;font-size:13px">30-minute session</div></div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="interview-credit-card">
+            <div class="interview-credit-value">8 Credits</div>
+            <div class="interview-credit-sub">30-minute session</div></div>""", unsafe_allow_html=True)
     with col_c3:
-        st.markdown("""<div style="background:#d4edda;border-radius:10px;padding:14px;text-align:center">
-            <div style="font-size:22px;font-weight:700;color:#155724">12 Credits</div>
-            <div style="color:#155724;font-size:13px">45-minute session</div></div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="interview-credit-card">
+            <div class="interview-credit-value">12 Credits</div>
+            <div class="interview-credit-sub">45-minute session</div></div>""", unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### ⚙️ Session Configuration")
@@ -1450,10 +1468,15 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
             key="interview_resume_upload"
         )
 
+        resume_text_available = bool(st.session_state.get("interview_resume_text"))
+        if resume_text_available:
+            st.success("✅ Resume pre-loaded from your optimized CV (upload optional).")
+
         st.markdown("#### 📊 What You'll Get")
         type_label = "Behavioral + Resume-based" if interview_type == "behavioral" else "Technical + Resume-based"
         st.markdown(f"""
-        <ul style="list-style:none;padding:0;margin:0">
+        <div class="interview-card" style="padding: 1.1rem 1.25rem;">
+        <ul style="list-style:none;padding:0;margin:0;line-height:1.75;color:var(--text,#1e293b);">
           <li>✅ {type_label} questions tailored to JD</li>
           <li>✅ <b>15 questions total</b> per session</li>
           <li>✅ AI Interviewer — question by question</li>
@@ -1463,7 +1486,83 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
           <li>✅ Full feedback report (PDF + DOCX)</li>
           <li>✅ Suggested improved answers</li>
         </ul>
+        </div>
         """, unsafe_allow_html=True)
+
+    # ─── Live F2F Mock Interview ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🎙️ Live F2F Mock Interview")
+    st.caption(
+        f"Pay-as-you-go live voice interview — {pricing.F2F_BLOCK_CREDITS} credits per "
+        f"{pricing.F2F_BLOCK_MINUTES}-minute block. Interview Pro: up to "
+        f"{pricing.F2F_MAX_MINUTES_INTERVIEW_PRO} min. Free plan: one 3-minute voice interview."
+    )
+
+    user_email = st.session_state.user_data["email"]
+    f2f_account_type = "business" if st.session_state.get("account_type") == "business" else "individual"
+    try:
+        gate = can_use_f2f(f2f_account_type, user_email)
+    except Exception:
+        gate = {"allowed": False, "free_once": False, "reason": "requires_interview_pro"}
+
+    if not gate["allowed"]:
+        if gate.get("reason") == "free_used":
+            st.warning("You've already used your one-time free voice interview. Upgrade to Interview Pro or add a pack to run more.")
+        else:
+            st.warning("F2F interviews require the **Interview Pro** plan or an active **credit pack**.")
+    elif gate.get("free_once"):
+        st.info("🎉 You have one free 3-minute voice interview available.")
+    else:
+        st.info(f"F2F interview available. You'll be billed {pricing.F2F_BLOCK_CREDITS} credits per {pricing.F2F_BLOCK_MINUTES}-minute block.")
+
+    if st.button("🎙️ Start Live F2F Interview", type="primary", key="start_f2f_btn",
+                 use_container_width=True, disabled=not gate["allowed"]):
+        if not gate["allowed"]:
+            st.error("F2F interviews require Interview Pro or an active credit pack.")
+        else:
+            with st.spinner("Starting your live F2F interview..."):
+                start = start_f2f_session(f2f_account_type, user_email)
+                if not start["ok"]:
+                    st.error(f"Could not start F2F session: {start.get('reason')}")
+                else:
+                    resume_text = st.session_state.interview_resume_text
+                    jd = st.session_state.interview_jd
+                    if not resume_text:
+                        resume_text = st.session_state.get("f2f_resume_text", "")
+                    try:
+                        qa_bank = generate_structured_interview_qa(
+                            resume_text or "No resume provided",
+                            jd or "General professional role",
+                            "15 minutes", "behavioral", "medium",
+                        )
+                        flat = flatten_questions(qa_bank) or []
+                    except Exception:
+                        flat = _demo_questions()
+                    if not flat:
+                        end_f2f_session(start["session_id"])
+                        st.error("Could not prepare interview questions. No credits were charged.")
+                    else:
+                        st.session_state.f2f_session_id = start["session_id"]
+                        st.session_state.f2f_is_free = start["is_free"]
+                        st.session_state.f2f_max_minutes = start["max_minutes"]
+                        st.session_state.f2f_questions = flat
+                        st.session_state.f2f_idx = 0
+                        st.session_state.f2f_results = []
+                        st.session_state.f2f_start_ts = time.time()
+                        st.session_state.f2f_blocks_charged = 0
+                        st.session_state.f2f_status = "active"
+                        st.session_state.f2f_notice = ""
+                        st.session_state.interview_phase = "f2f"
+                        if not start["is_free"]:
+                            block = charge_f2f_block(start["session_id"])
+                            if block.get("ok"):
+                                st.session_state.f2f_blocks_charged = block.get("blocks_charged", 0)
+                            else:
+                                end_f2f_session(start["session_id"])
+                                st.error(f"Could not charge F2F block: {block.get('reason')}")
+                                return
+                        st.success("Live interview started. Speak your answers — you'll be billed per 15-minute block.")
+                        st.rerun()
 
     # ─── Generate & Download Q&A Bank ────────────────────────────────────────
     st.markdown("---")
@@ -1472,7 +1571,7 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
 
     gen_col1, gen_col2 = st.columns([2, 1])
 
-    if jd.strip() and uploaded:
+    if jd.strip() and (uploaded or resume_text_available):
         with gen_col1:
             if st.button("📚 Generate Q&A Bank + Start Practice Session",
                          type="primary", key="start_practice_btn",
@@ -1484,13 +1583,21 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
 
                 with st.spinner("🤖 AI is generating your personalized interview questions..."):
                     try:
-                        resume_text = extract_resume_fn(uploaded)
+                        if uploaded:
+                            resume_text = extract_resume_fn(uploaded)
+                        else:
+                            resume_text = st.session_state.get("interview_resume_text", "")
                         st.session_state.interview_resume_text = resume_text
 
                         qa_bank = generate_structured_interview_qa(resume_text, jd, duration, st.session_state.interview_type, st.session_state.get("interview_difficulty", "medium"))
                         st.session_state.interview_qa_bank = qa_bank
 
                         flat = flatten_questions(qa_bank)
+                        if not flat:
+                            st.session_state.interview_qa_bank = None
+                            st.error("⚠️ No interview questions could be generated. No credits were charged. Please try again.")
+                            return
+
                         st.session_state.interview_questions_flat = flat
                         st.session_state.interview_current_idx = 0
                         st.session_state.interview_session_results = []
@@ -1498,7 +1605,9 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
 
                         # Deduct credits
                         user_email = st.session_state.user_data["email"]
-                        deduct_credits_fn(user_email, credits_needed, feature="Interview Practice")
+                        if not deduct_credits_fn(user_email, credits_needed, feature="Interview Practice"):
+                            st.error("⚠️ Credit deduction failed. Your session was not started and no credits were used. Please try again.")
+                            return
 
                         st.session_state.interview_phase = "session"
                         st.success(f"✅ {len(flat)} questions generated! {credits_needed} credits used. Starting session...")
@@ -1568,7 +1677,7 @@ def _transcribe_audio_deepgram(audio_bytes: bytes) -> str:
 
 def _render_voice_recorder(session_key: str):
     """Record voice using native st.audio_input, transcribe via Deepgram, auto-fill text area."""
-    audio = st.audio_input("Record your answer (click mic to start/stop)")
+    audio = st.audio_input("Record your answer (click mic to start/stop)", key=f"audio_{session_key}")
     if audio is not None:
         audio_bytes = audio.getvalue()
         if not audio_bytes or len(audio_bytes) < 100:
@@ -1598,22 +1707,23 @@ def _timer_component_html(seconds: int, question_idx: int = 0) -> str:
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            font-family: 'Courier New', monospace;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             display: flex; align-items: center; justify-content: flex-end;
             min-height: 70px; background: transparent;
         }}
         .timer {{
-            padding: 12px 24px; border-radius: 12px;
-            background: linear-gradient(135deg, #1a1a2e, #16213e);
-            color: #fff; font-size: 32px; font-weight: 700;
-            text-align: center; letter-spacing: 2px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            min-width: 160px;
+            padding: 10px 20px; border-radius: 12px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            color: #ff8c00; font-size: 28px; font-weight: 800;
+            text-align: center; letter-spacing: 1px;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+            min-width: 140px;
         }}
-        .timer.warning {{ color: #e67e22; }}
-        .timer.danger {{ color: #e94560; animation: blink 0.8s infinite; }}
-        .label {{ font-size: 11px; color: #a0b4d6; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }}
-        @keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:0.3}} }}
+        .timer.warning {{ color: #f59e0b; border-color: #fde68a; background: #fffbeb; }}
+        .timer.danger {{ color: #ef4444; border-color: #fecaca; background: #fef2f2; animation: blink 0.8s infinite; }}
+        .label {{ font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; text-align: center; }}
+        @keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:0.4}} }}
     </style>
 </head>
 <body>
@@ -1669,18 +1779,18 @@ def _render_inline_feedback(q_obj: dict):
     answer = st.session_state.interview_last_answer or ""
     score = eval_data.get("score", 0)
     band = "Excellent" if score >= 85 else "Good" if score >= 70 else "Average" if score >= 55 else "Needs Improvement"
-    bc = "#2ecc71" if score >= 85 else "#3498db" if score >= 70 else "#f39c12" if score >= 55 else "#e94560"
+    bc = "#10b981" if score >= 85 else "#3b82f6" if score >= 70 else "#f59e0b" if score >= 55 else "#ef4444"
 
     # Score bar
     st.markdown(f"""
-    <div style="border-left:5px solid {bc};background:#f8f9ff;border-radius:0 10px 10px 0;padding:16px 20px;margin-bottom:16px">
+    <div style="border-left:5px solid {bc};background:var(--surface, #ffffff);border-radius:0 12px 12px 0;border:1px solid var(--border, #e2e8f0);border-left-width:5px;padding:16px 20px;margin-bottom:16px;box-shadow:var(--shadow);">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
         <div>
-          <span style="font-size:13px;font-weight:600;color:#888">📊 Score</span>
-          <span style="background:{bc};color:#fff;padding:2px 12px;border-radius:12px;font-size:12px;font-weight:700;margin-left:8px">{band}</span>
-          <div style="color:#333;font-size:14px;margin-top:6px;line-height:1.5">{eval_data.get("brief_feedback", "")}</div>
+          <span style="font-size:13px;font-weight:600;color:var(--muted, #64748b)">📊 Score</span>
+          <span style="background:{bc};color:#fff;padding:3px 12px;border-radius:12px;font-size:12px;font-weight:700;margin-left:8px">{band}</span>
+          <div style="color:var(--text, #1e293b);font-size:14px;margin-top:6px;line-height:1.5;font-weight:500">{eval_data.get("brief_feedback", "")}</div>
         </div>
-        <div style="font-size:36px;font-weight:800;color:{bc};line-height:1">{score}<span style="font-size:16px;color:#888">/100</span></div>
+        <div style="font-size:36px;font-weight:800;color:{bc};line-height:1">{score}<span style="font-size:16px;color:var(--muted, #64748b)">/100</span></div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1691,19 +1801,19 @@ def _render_inline_feedback(q_obj: dict):
     if covered or missed:
         kw1, kw2 = st.columns(2)
         with kw1:
-            tags = "".join(f"<span style='background:#d4edda;color:#155724;padding:3px 12px;border-radius:14px;font-size:12px;font-weight:500;display:inline-block;margin:3px 6px 3px 0'>{k}</span>" for k in covered)
+            tags = "".join(f"<span class='interview-badge interview-badge-success' style='margin:3px 6px 3px 0'>{k}</span>" for k in covered)
             st.markdown(f"""
-            <div style="border:1px solid #d4edda;border-radius:10px;padding:12px 14px;background:#f6fff6;margin-bottom:10px">
-              <div style="font-size:13px;font-weight:700;color:#155724;margin-bottom:6px">✅ Covered</div>
-              <div>{tags if tags else '<span style="color:#888;font-size:12px">None</span>'}</div>
+            <div style="border:1px solid #a7f3d0;border-radius:10px;padding:12px 14px;background:#ecfdf5;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#047857;margin-bottom:6px">✅ Covered</div>
+              <div>{tags if tags else '<span style="color:#64748b;font-size:12px">None</span>'}</div>
             </div>
             """, unsafe_allow_html=True)
         with kw2:
-            tags = "".join(f"<span style='background:#f8d7da;color:#721c24;padding:3px 12px;border-radius:14px;font-size:12px;font-weight:500;display:inline-block;margin:3px 6px 3px 0'>{k}</span>" for k in missed)
+            tags = "".join(f"<span class='interview-badge interview-badge-danger' style='margin:3px 6px 3px 0'>{k}</span>" for k in missed)
             st.markdown(f"""
-            <div style="border:1px solid #f8d7da;border-radius:10px;padding:12px 14px;background:#fff6f6;margin-bottom:10px">
-              <div style="font-size:13px;font-weight:700;color:#721c24;margin-bottom:6px">❌ Missed</div>
-              <div>{tags if tags else '<span style="color:#888;font-size:12px">None — great coverage!</span>'}</div>
+            <div style="border:1px solid #fecaca;border-radius:10px;padding:12px 14px;background:#fef2f2;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#b91c1c;margin-bottom:6px">❌ Missed</div>
+              <div>{tags if tags else '<span style="color:#64748b;font-size:12px">None — great coverage!</span>'}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1713,19 +1823,19 @@ def _render_inline_feedback(q_obj: dict):
     if strengths or improvements:
         sc, ic = st.columns(2)
         with sc:
-            items = "".join(f"<div style='padding:3px 0;font-size:13px;color:#155724'>✅ {s}</div>" for s in strengths)
+            items = "".join(f"<div style='padding:3px 0;font-size:13px;color:#047857;font-weight:500'>✅ {s}</div>" for s in strengths)
             st.markdown(f"""
-            <div style="border:1px solid #d4edda;border-radius:10px;padding:12px 14px;background:#f6fff6;margin-bottom:10px">
-              <div style="font-size:13px;font-weight:700;color:#155724;margin-bottom:4px">✅ Strengths</div>
-              {items if items else '<div style="color:#888;font-size:12px">None highlighted</div>'}
+            <div style="border:1px solid #a7f3d0;border-radius:10px;padding:12px 14px;background:#ecfdf5;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#047857;margin-bottom:4px">✅ Strengths</div>
+              {items if items else '<div style="color:#64748b;font-size:12px">None highlighted</div>'}
             </div>
             """, unsafe_allow_html=True)
         with ic:
-            items = "".join(f"<div style='padding:3px 0;font-size:13px;color:#856404'>📈 {imp}</div>" for imp in improvements)
+            items = "".join(f"<div style='padding:3px 0;font-size:13px;color:#b45309;font-weight:500'>📈 {imp}</div>" for imp in improvements)
             st.markdown(f"""
-            <div style="border:1px solid #ffc107;border-radius:10px;padding:12px 14px;background:#fffef5;margin-bottom:10px">
-              <div style="font-size:13px;font-weight:700;color:#856404;margin-bottom:4px">📈 Areas to Improve</div>
-              {items if items else '<div style="color:#888;font-size:12px">None highlighted</div>'}
+            <div style="border:1px solid #fde68a;border-radius:10px;padding:12px 14px;background:#fffbeb;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#b45309;margin-bottom:4px">📈 Areas to Improve</div>
+              {items if items else '<div style="color:#64748b;font-size:12px">None highlighted</div>'}
             </div>
             """, unsafe_allow_html=True)
 
@@ -1759,6 +1869,230 @@ def _render_inline_feedback(q_obj: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2: Interview Session
 # ─────────────────────────────────────────────────────────────────────────────
+def _demo_questions():
+    """Lightweight fallback questions for F2F when the AI generator fails."""
+    return [
+        {"section": "behavioral", "difficulty": "Simple",
+         "question": "Tell me about yourself and your professional background.",
+         "ideal_answer": "A concise STAR-structured summary covering experience, key achievements, and why you fit the role.",
+         "key_points": ["Relevant experience", "Measurable achievements", "Alignment with the role"]},
+        {"section": "behavioral", "difficulty": "Hard",
+         "question": "Describe a time you faced a major challenge at work and how you handled it.",
+         "ideal_answer": "Use the STAR format: Situation, Task, Action, Result, with a concrete measurable outcome.",
+         "key_points": ["Clear situation", "Your specific action", "Quantified result"]},
+        {"section": "behavioral", "difficulty": "Simple",
+         "question": "Why do you want this role, and what makes you a good fit?",
+         "ideal_answer": "Connect your skills and experience to the role's key requirements with specific examples.",
+         "key_points": ["Company/role research", "Skill-to-job mapping", "Enthusiasm"]},
+        {"section": "behavioral", "difficulty": "Very Hard",
+         "question": "Tell me about a time you had to lead or influence a team without formal authority.",
+         "ideal_answer": "Describe how you built trust, communicated a vision, and delivered results through others.",
+         "key_points": ["Influence strategy", "Stakeholder management", "Outcome"]},
+        {"section": "behavioral", "difficulty": "Simple",
+         "question": "Where do you see yourself in five years?",
+         "ideal_answer": "A growth-oriented answer that aligns your ambitions with the company's trajectory.",
+         "key_points": ["Career direction", "Growth plan", "Fit with company"]},
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: Live F2F (voice) interview — pay-as-you-go per 15-min block
+# ─────────────────────────────────────────────────────────────────────────────
+def _phase_f2f(export_qa_fn=None):
+    session_id = st.session_state.get("f2f_session_id")
+    if not session_id:
+        st.error("No active F2F session. Returning to setup.")
+        st.session_state.interview_phase = "setup"
+        st.rerun()
+        return
+
+    questions = st.session_state.get("f2f_questions", [])
+    idx = st.session_state.get("f2f_idx", 0)
+    status = st.session_state.get("f2f_status", "active")
+
+    # ---- block billing check (wall-clock based) ----
+    elapsed_min = 0
+    if st.session_state.get("f2f_start_ts"):
+        elapsed_min = (time.time() - st.session_state["f2f_start_ts"]) / 60.0
+    blocks_charged = st.session_state.get("f2f_blocks_charged", 0)
+    blocks_due = int(elapsed_min // pricing.F2F_BLOCK_MINUTES)
+
+    if status == "active" and not st.session_state.get("f2f_is_free") and blocks_due >= blocks_charged:
+        res = charge_f2f_block(session_id)
+        if res.get("ok"):
+            if res.get("reason") == "max_minutes":
+                st.session_state.f2f_status = "ended"
+                st.session_state.f2f_notice = "⏰ Session reached its time limit. Thanks for practicing!"
+                status = "ended"
+            else:
+                st.session_state.f2f_blocks_charged = res.get("blocks_charged", blocks_charged)
+                blocks_charged = st.session_state["f2f_blocks_charged"]
+        else:
+            st.session_state.f2f_status = "ended"
+            st.session_state.f2f_notice = "❌ Credits ran out — session ended. Add credits or a pack and start again."
+            status = "ended"
+            end_f2f_session(session_id)
+
+    # ---- header ----
+    is_free = st.session_state.get("f2f_is_free", False)
+    total_cost = (blocks_charged if blocks_charged else 0) * pricing.F2F_BLOCK_CREDITS
+    st.markdown("""
+    <div class="interview-header" style="margin-bottom:16px;">
+        <h2 style="margin:0; font-size:1.8rem;">🎙️ Live F2F Interview</h2>
+        <p style="margin:6px 0 0; font-size:0.95rem;">Speak naturally — real-time voice interview simulation.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Elapsed", f"{int(elapsed_min)} min")
+    with m2:
+        st.metric("Blocks Billed", f"{blocks_charged} × {pricing.F2F_BLOCK_MINUTES} min")
+    with m3:
+        st.metric("Cost So Far", f"{total_cost} credits" if not is_free else "Free")
+    with m4:
+        cap = st.session_state.get("f2f_max_minutes") or "—"
+        st.metric("Session Cap", f"{cap} min")
+
+    if status == "ended":
+        st.info(st.session_state.get("f2f_notice", "Session ended."))
+        results = st.session_state.get("f2f_results", [])
+        if results:
+            st.markdown("### 📋 Your F2F Session Summary")
+            for i, r in enumerate(results):
+                ev = r.get("evaluation", {})
+                score = ev.get("score", 0)
+                st.markdown(f"**Q{i+1}.** {r.get('question', '')[:90]} — *{score}/100*")
+
+        # Download the question bank used in this session
+        f2f_qs = st.session_state.get("f2f_questions", [])
+        if f2f_qs and export_qa_fn:
+            bank = {}
+            for q in f2f_qs:
+                bank.setdefault(q.get("section", "general"), []).append(q)
+            flat_text = _qa_bank_to_text(bank)
+            try:
+                pdf_buf, docx_buf = export_qa_fn(flat_text)
+                st.markdown("### 📥 Download Question Bank")
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    st.download_button("📥 Download Q&A PDF", data=pdf_buf,
+                                       file_name="f2f_question_bank.pdf", mime="application/pdf",
+                                       key="dl_f2f_pdf")
+                with dc2:
+                    st.download_button("📥 Download Q&A DOCX", data=docx_buf,
+                                       file_name="f2f_question_bank.docx",
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       key="dl_f2f_docx")
+            except Exception as e:
+                st.warning(f"Export failed: {e}")
+
+        if st.button("↩️ Return to Setup", key="f2f_back_setup", use_container_width=True):
+            _reset_interview_session()
+            st.rerun()
+        return
+
+    # ---- remaining time in current block ----
+    block_remaining = pricing.F2F_BLOCK_MINUTES - (int(elapsed_min) % pricing.F2F_BLOCK_MINUTES)
+    st.progress(min(1.0, (int(elapsed_min) % pricing.F2F_BLOCK_MINUTES) / pricing.F2F_BLOCK_MINUTES))
+    st.caption(f"⏳ {block_remaining} min remaining in current block. Answer freely; time is billed in 15-min blocks.")
+
+    if idx >= len(questions):
+        st.session_state.f2f_status = "ended"
+        st.session_state.f2f_notice = "All questions covered — session complete!"
+        if not is_free:
+            end_f2f_session(session_id)
+        st.rerun()
+        return
+
+    q_obj = questions[idx]
+    section = q_obj["section"].title()
+    difficulty = q_obj["difficulty"]
+    question_text = q_obj["question"]
+
+    st.markdown(f"""
+    <div class="interview-card interview-card-accent" style="padding:18px 20px;margin-bottom:12px;">
+        <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center;">
+            <span class="interview-badge interview-badge-neutral">{section}</span>
+            <span class="interview-badge interview-badge-primary">{difficulty}</span>
+        </div>
+        <p style="font-size:18px;font-weight:600;color:var(--text, #1e293b);margin:6px 0 0;line-height:1.5;">{question_text}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c_left, c_right = st.columns([1, 1])
+    with c_left:
+        st.components.v1.html(tts_component_html(question_text), height=64)
+    with c_right:
+        st.components.v1.html(_timer_component_html(120, idx), height=64)
+
+    voice_key = f"f2f_voice_answer_{idx}"
+    typed_key = f"f2f_typed_answer_{idx}"
+
+    tab_type, tab_voice = st.tabs(["⌨️ Type Answer", "🎙️ Speak Answer"])
+    with tab_type:
+        typed_answer = st.text_area("Type your answer here:", height=200,
+                                    key=typed_key, label_visibility="collapsed",
+                                    placeholder="Speak or type your answer naturally.")
+    with tab_voice:
+        _render_voice_recorder(voice_key)
+        voice_answer = st.text_area("Your answer (editable):", height=140,
+                                    key=voice_key, label_visibility="collapsed",
+                                    placeholder="Transcript auto-fills here after speaking.")
+
+    final_answer = typed_answer.strip() if typed_answer.strip() else voice_answer.strip()
+
+    btn_col1, btn_col2, btn_col3 = st.columns([2, 1, 1])
+    with btn_col1:
+        if st.button("✅ Submit Answer", type="primary", key=f"f2f_submit_{idx}",
+                     disabled=not final_answer, use_container_width=True):
+            _f2f_submit_answer(q_obj, final_answer, session_id)
+    with btn_col2:
+        if st.button("⏭️ Next Question", key=f"f2f_next_{idx}", use_container_width=True):
+            st.session_state.f2f_idx = idx + 1
+            st.rerun()
+    with btn_col3:
+        if st.button("🔚 End Session", key=f"f2f_end_{idx}", use_container_width=True):
+            st.session_state.f2f_status = "ended"
+            st.session_state.f2f_notice = "Session ended by you. Great practice!"
+            if not is_free:
+                end_f2f_session(session_id)
+            st.rerun()
+
+    if st.session_state.get("f2f_results"):
+        with st.expander(f"📋 Answered so far — {len(st.session_state['f2f_results'])}", expanded=False):
+            for i, r in enumerate(st.session_state["f2f_results"]):
+                ev = r.get("evaluation", {})
+                score = ev.get("score", 0)
+                st.markdown(f"**Q{i+1}.** {r.get('question', '')[:90]} — *{score}/100*")
+
+
+def _f2f_submit_answer(q_obj: dict, answer: str, session_id):
+    """Evaluate an F2F answer, store it, and advance to the next question."""
+    try:
+        with st.spinner("🤖 AI is evaluating your answer..."):
+            evaluation = evaluate_answer(
+                question=q_obj["question"],
+                ideal_answer=q_obj["ideal_answer"],
+                key_points=q_obj["key_points"],
+                user_answer=answer,
+                section=q_obj["section"],
+                difficulty=q_obj["difficulty"],
+            )
+    except Exception:
+        evaluation = {"score": 0, "feedback": "Evaluation unavailable.", "suggestions": []}
+
+    results = list(st.session_state.get("f2f_results", []))
+    results.append({
+        "question": q_obj["question"],
+        "answer": answer,
+        "evaluation": evaluation,
+    })
+    st.session_state.f2f_results = results
+    st.session_state.f2f_idx = st.session_state.get("f2f_idx", 0) + 1
+    st.rerun()
+
+
 def _phase_session():
     questions = st.session_state.interview_questions_flat
     idx = st.session_state.interview_current_idx
@@ -1774,20 +2108,19 @@ def _phase_session():
     # Progress header
     progress_pct = idx / total
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:14px;padding:20px;margin-bottom:18px">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-            <div>
-                <h2 style="color:#e94560;margin:0">🤖 AI Interviewer</h2>
-                <p style="color:#a0b4d6;margin:4px 0 0">Answer each question as if in a real interview</p>
+    <div class="interview-header" style="padding: 1.25rem 1.5rem; margin-bottom: 1.25rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <div style="text-align:left;">
+                <h2 style="color:#1e293b !important; margin:0; font-size:1.6rem; font-weight:700;">🤖 AI Interviewer</h2>
+                <p style="color:#1e293b !important; margin:2px 0 0; font-size:0.9rem; opacity:0.9;">Answer each question as if in a real interview</p>
             </div>
-            <div style="text-align:right">
-                <div style="color:#fff;font-size:20px;font-weight:700">Question {idx+1}/{total}</div>
-                <div style="color:#a0b4d6;font-size:13px">Session in progress</div>
+            <div style="text-align:right;">
+                <div style="color:#1e293b; font-size:1.25rem; font-weight:800;">Question {idx+1}/{total}</div>
+                <div style="color:#1e293b; font-size:0.8rem; font-weight:600; opacity:0.85;">Session in progress</div>
             </div>
         </div>
-        <div style="margin-top:14px;background:#0f3460;border-radius:8px;height:8px;overflow:hidden">
-            <div style="background:linear-gradient(90deg,#e94560,#fc5c7d);height:8px;width:{progress_pct*100:.1f}%;
-                        border-radius:8px;transition:width 0.5s"></div>
+        <div class="interview-progress-wrap">
+            <div class="interview-progress-fill" style="width:{progress_pct*100:.1f}%;"></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1803,8 +2136,8 @@ def _phase_session():
     question_text = q_obj["question"]
 
     # Difficulty badge color
-    diff_colors = {"Simple": "#2ecc71", "Hard": "#e67e22", "Very Hard": "#e94560"}
-    diff_color = diff_colors.get(difficulty, "#888")
+    diff_colors = {"Simple": "#10b981", "Easy": "#10b981", "Medium": "#f59e0b", "Hard": "#f59e0b", "Very Hard": "#ef4444"}
+    diff_color = diff_colors.get(difficulty, "#ff8c00")
 
     # Determine per-question time limit (total duration in sec / number of questions)
     total_duration_map = {"15 minutes": 900, "30 minutes": 1800, "45 minutes": 2700}
@@ -1813,17 +2146,12 @@ def _phase_session():
 
     # Question card
     st.markdown(f"""
-    <div style="border-left:4px solid {diff_color};background:#f8f9ff;border-radius:0 12px 12px 0;
-                padding:18px 20px;margin-bottom:12px">
-        <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
-            <span style="background:#16213e;color:#a0b4d6;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600">
-                {section}
-            </span>
-            <span style="background:#6c5ce7;color:#fff;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600">
-                {difficulty}
-            </span>
+    <div style="border-left:5px solid {diff_color}; background: var(--surface, #ffffff); border: 1px solid var(--border, #e2e8f0); border-left-width: 5px; border-radius: 0 12px 12px 0; padding: 18px 20px; margin-bottom: 14px; box-shadow: var(--shadow);">
+        <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; align-items:center;">
+            <span class="interview-badge interview-badge-neutral">{section}</span>
+            <span class="interview-badge interview-badge-primary">{difficulty}</span>
         </div>
-        <p style="font-size:18px;font-weight:600;color:#1a1a2e;margin:0;line-height:1.5">{question_text}</p>
+        <p style="font-size:18px; font-weight:600; color:var(--text, #1e293b); margin:0; line-height:1.5;">{question_text}</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1899,13 +2227,13 @@ def _phase_session():
             for i, res in enumerate(st.session_state.interview_session_results):
                 ev = res.get("evaluation", {})
                 score = ev.get("score", 0)
-                color = "#2ecc71" if score >= 70 else "#e67e22" if score >= 50 else "#e94560"
+                color = "#10b981" if score >= 70 else "#f59e0b" if score >= 50 else "#ef4444"
                 q_text = res["question_obj"]["question"][:80]
                 sub_scores = f"M:{ev.get('meaning_match',0)} S:{ev.get('structure_score',0)} C:{ev.get('clarity_score',0)} D:{ev.get('depth_score',0)}"
                 with st.container():
                     cols = st.columns([3, 1, 1])
-                    cols[0].markdown(f"<span style='font-size:13px;color:#333'>Q{i+1}. {q_text}...</span>", unsafe_allow_html=True)
-                    cols[1].markdown(f"<span style='font-size:11px;color:#888'>{sub_scores}</span>", unsafe_allow_html=True)
+                    cols[0].markdown(f"<span style='font-size:13px;color:var(--text, #1e293b);font-weight:500'>Q{i+1}. {q_text}...</span>", unsafe_allow_html=True)
+                    cols[1].markdown(f"<span style='font-size:11px;color:var(--muted, #64748b)'>{sub_scores}</span>", unsafe_allow_html=True)
                     cols[2].markdown(f"<span style='font-size:13px;font-weight:700;color:{color}'>{score}/100</span>", unsafe_allow_html=True)
 
 
@@ -1968,15 +2296,15 @@ def _phase_report():
 
     score = report["overall_score"]
     band = report["performance_band"]
-    band_color_map = {"Excellent": "#2ecc71", "Good": "#3498db", "Average": "#e67e22", "Needs Improvement": "#e94560"}
-    band_color = band_color_map.get(band, "#888")
+    band_color_map = {"Excellent": "#047857", "Good": "#1d4ed8", "Average": "#b45309", "Needs Improvement": "#b91c1c"}
+    band_color = band_color_map.get(band, "#ff8c00")
 
     # ── Score card ────────────────────────────────────────────────────────────
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:16px;padding:28px;margin-bottom:20px;text-align:center">
-        <h1 style="color:#e94560;margin:0;font-size:52px;font-weight:800">{score}<span style="font-size:24px">/100</span></h1>
-        <div style="color:{band_color};font-size:22px;font-weight:700;margin:6px 0">{band}</div>
-        <p style="color:#a0b4d6;margin:0">Your Interview Performance Score</p>
+    <div class="interview-score-banner">
+        <h1 class="interview-score-num">{score}<span style="font-size:1.6rem; opacity:0.8;">/100</span></h1>
+        <div class="interview-score-band" style="color:{band_color};">{band}</div>
+        <p style="color:#1e293b; margin:4px 0 0; font-size:1.05rem; font-weight:600; opacity:0.95;">Your Interview Performance Score</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2038,15 +2366,16 @@ def _phase_report():
         ev = res.get("evaluation", {})
         user_ans = res.get("user_answer", "")
         s = ev.get("score", 0)
-        card_color = "#d4edda" if s >= 70 else "#fff3cd" if s >= 50 else "#f8d7da"
-        border_color = "#28a745" if s >= 70 else "#ffc107" if s >= 50 else "#dc3545"
+        border_color = "#10b981" if s >= 70 else "#f59e0b" if s >= 50 else "#ef4444"
 
         with st.expander(f"Q{i+1}. {q_obj.get('question','')[:80]}... — {s}/100", expanded=False):
             st.markdown(f"""
-            <div style="border-left:4px solid {border_color};background:{card_color};
-                        border-radius:0 10px 10px 0;padding:14px;margin-bottom:12px">
-                <b>{q_obj.get('section','').title()} | {q_obj.get('difficulty','')}</b><br>
-                {q_obj.get('question','')}
+            <div style="border-left:5px solid {border_color}; background:var(--surface, #ffffff); border:1px solid var(--border, #e2e8f0); border-left-width:5px; border-radius:0 10px 10px 0; padding:14px 18px; margin-bottom:12px; box-shadow:var(--shadow);">
+                <div style="margin-bottom:6px;">
+                    <span class="interview-badge interview-badge-neutral">{q_obj.get('section','').title()}</span>
+                    <span class="interview-badge interview-badge-primary" style="margin-left:6px;">{q_obj.get('difficulty','')}</span>
+                </div>
+                <div style="font-size:16px; font-weight:600; color:var(--text, #1e293b);">{q_obj.get('question','')}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -2106,8 +2435,8 @@ def _phase_report():
     st.markdown("*Keywords extracted from the job description — shows what your resume covers vs misses:*")
 
     if jd_kw:
-        jd_covered_badges = " ".join([f'<span style="background:#d4edda;color:#155724;padding:4px 12px;border-radius:15px;font-size:12px;margin:3px;display:inline-block">✅ {k}</span>' for k in resume_covered])
-        jd_missed_badges = " ".join([f'<span style="background:#f8d7da;color:#721c24;padding:4px 12px;border-radius:15px;font-size:12px;margin:3px;display:inline-block">❌ {k}</span>' for k in resume_missing])
+        jd_covered_badges = " ".join([f'<span class="interview-badge interview-badge-success" style="margin:3px;display:inline-block">✅ {k}</span>' for k in resume_covered])
+        jd_missed_badges = " ".join([f'<span class="interview-badge interview-badge-danger" style="margin:3px;display:inline-block">❌ {k}</span>' for k in resume_missing])
 
         mc1, mc2 = st.columns(2)
         with mc1:
@@ -2199,8 +2528,16 @@ def _reset_interview_session():
     keys = [
         "interview_phase", "interview_qa_bank", "interview_questions_flat",
         "interview_current_idx", "interview_session_results", "interview_report",
-        "voice_transcript_buffer",
+        "voice_transcript_buffer", "interview_show_feedback", "interview_last_evaluation",
+        "interview_last_answer", "f2f_session_id", "f2f_questions", "f2f_idx", "f2f_results",
     ]
     for k in keys:
         if k in st.session_state:
             del st.session_state[k]
+
+    to_delete = [
+        k for k in st.session_state.keys()
+        if k.startswith(("voice_answer_", "typed_answer_", "f2f_voice_answer_", "f2f_typed_answer_", "audio_", "_dg_"))
+    ]
+    for k in to_delete:
+        del st.session_state[k]

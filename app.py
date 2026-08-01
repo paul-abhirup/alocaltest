@@ -33,6 +33,7 @@ from cv_generator import generate_cv,recommend_jobs_from_resume_ai, generate_cov
 import job_aggregator as ja
 from templates import apply_template
 from utils import optimize_keywords, enforce_page_limit, get_gemini_response, get_all_country_dial_codes
+from interview_module import show_interview_practice_page, DURATION_CREDITS
 
 
 
@@ -397,6 +398,10 @@ if 'cv_pdf_bytes' not in st.session_state:
 if 'cv_docx_bytes' not in st.session_state:
     st.session_state.cv_docx_bytes = None
 
+# Interview module session state
+from interview_module import _init_session as _init_interview_session
+_init_interview_session()
+
 
 def auto_save_progress():
     """Auto-save user progress"""
@@ -621,7 +626,7 @@ def main():
 
     
     # Main content
-    tab1, tab3, tab4 = st.tabs(["🚀 Smart Job Match & Optimizer", "📊 Analytics", "💳 Billing"])
+    tab1, tab3, tab4, tab5 = st.tabs(["🚀 Smart Job Match & Optimizer", "📊 Analytics", "💳 Billing", "🎤 Interview Practice"])
 
     with tab1:
         show_smart_job_match_page()
@@ -631,6 +636,15 @@ def main():
 
     with tab4:
         show_billing_page()
+
+    with tab5:
+        show_interview_practice_page(
+            check_access_fn=check_user_access,
+            deduct_credits_fn=deduct_user_credits,
+            extract_resume_fn=extract_resume_text,
+            export_qa_fn=export_interview_qa,
+            generate_qa_fn=generate_interview_qa,
+        )
 
 def _render_job_results_unified(result, resume_text):
     """Render the search result stored in session with 1-click optimization button."""

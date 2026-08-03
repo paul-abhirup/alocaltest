@@ -129,6 +129,8 @@ def is_resume_job_mismatched(
 
     overlap = resume_terms & job_terms
 
-    min_required = max(2, int(len(resume_terms) * threshold))
+    # Very lenient: only drop when there is ZERO distinctive-term overlap with
+    # the resume, so strong-but-not-verbatim matches still surface.
+    min_required = max(1, int(len(resume_terms) * 0.03))
 
     return len(overlap) < min_required

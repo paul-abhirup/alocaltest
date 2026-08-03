@@ -34,6 +34,16 @@ PLANS = {
         "f2f": True,
         "f2f_max_minutes": F2F_MAX_MINUTES_INTERVIEW_PRO,
     },
+    # Voucher Pro mirrors Interview Pro's allowance but excludes the ElevenLabs-
+    # powered live voice interview. Granted only via voucher redemption.
+    "Voucher Pro": {
+        "price_usd": 0,
+        "price_inr": 0,
+        "monthly_credits": 120,
+        "f2f": False,
+        "f2f_max_minutes": 0,
+        "voucher_only": True,
+    },
 }
 
 FREE_PLAN = {

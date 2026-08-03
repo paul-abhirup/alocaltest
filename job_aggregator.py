@@ -21,6 +21,7 @@ import html
 import hashlib
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Optional
@@ -44,7 +45,8 @@ logger = logging.getLogger(__name__)
 
 # ----------------------------- Tunables ---------------------------------------
 DEFAULT_TIMEOUT = 8            # seconds per source request
-MAX_RESULTS_PER_SOURCE = 25
+MAX_RESULTS_PER_SOURCE = 50
+MAX_VARIANTS_PER_SOURCE = 2    # search variants fan-out per source (recall boost)
 MAX_DESC_CHARS = 8000         # cap description length before scoring (perf)
 USER_AGENT = "CVOLVE-PRO-JobAggregator/1.0 (+https://cvolvepro.com)"
 
@@ -297,6 +299,11 @@ class RemotiveAdapter(SourceAdapter):
     BASE = "https://remotive.com/api/remote-jobs"
 
     def fetch(self, query):
+        # Remotive is a remote-only board: nothing to offer when the user
+        # explicitly wants only Onsite/Hybrid jobs.
+        wants = set(query.work_types or [])
+        if wants and ONSITE_HYBRID in wants and not (wants & _REMOTE_FAMILY):
+            return []
         data = self._request(self.BASE, params={"search": query.title, "limit": query.limit})
         return (data.get("jobs") or [])[: query.limit]
 
@@ -306,8 +313,11 @@ class RemotiveAdapter(SourceAdapter):
             return None
         cand = (raw.get("candidate_required_location") or "").strip()
         remote_type = REMOTE_UNKNOWN
-        if cand.lower() in ("worldwide", "anywhere"):
+        low = cand.lower()
+        if any(k in low for k in ("worldwide", "anywhere", "global", "emea")):
             remote_type = REMOTE_WORLDWIDE
+        elif cand and "remote" not in low and cand != "—":
+            remote_type = REMOTE_IN_COUNTRY
         job_type = (raw.get("job_type") or "").replace("_", " ").strip() or "—"
         return Job(
             title=title,
@@ -330,14 +340,22 @@ class ArbeitnowAdapter(SourceAdapter):
 
     def fetch(self, query):
         # Arbeitnow has no server-side search param → filter client-side by title/tags.
+        # Match on ALL query tokens (not exact substring) so multi-word queries
+        # ("python developer") still surface relevant jobs.
         data = self._request(self.BASE)
         jobs = data.get("data") or []
         q = query.title.lower().strip()
         if q:
+            tokens = [t for t in re.split(r"[\s/,-]+", q) if len(t) > 2]
+            if not tokens:
+                tokens = [q]
             def hay(j):
                 return (j.get("title", "") + " " + " ".join(j.get("tags", []) or [])).lower()
-            jobs = [j for j in jobs if q in hay(j)]
-        return jobs[: query.limit]
+            if len(tokens) == 1:
+                jobs = [j for j in jobs if tokens[0] in hay(j)]
+            else:
+                jobs = [j for j in jobs if all(t in hay(j) for t in tokens)]
+        return jobs[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("title") or "").strip()
@@ -385,28 +403,41 @@ class AdzunaAdapter(SourceAdapter):
 
     def fetch(self, query):
         country = (query.country or "gb").lower()
-        target_countries = ["us", "gb"] if country == "all" else [country]
+        # "All Countries" queries the top markets instead of just US+GB.
+        # Kept to 4 countries so free-tier quota (~300 calls/day) is sustainable.
+        target_countries = ["us", "gb", "in", "de"] if country == "all" else [country]
+        per_page = min(50, max(20, query.limit // len(target_countries)))
+        # Paginate through 2 pages for a single country; single page when fanning
+        # out across many countries.
+        pages = 2 if len(target_countries) == 1 else 1
         all_results = []
+        wants = set(query.work_types or [])
+        wants_remote = bool(wants & _REMOTE_FAMILY) and ONSITE_HYBRID not in wants
+        what = query.title
+        if wants_remote:
+            what = f"{what} remote"
         for c in target_countries:
             self._currency = _ADZUNA_CURRENCY.get(c, "")
-            params = {
-                "app_id": self.app_id, "app_key": self.app_key,
-                "results_per_page": query.limit if len(target_countries) == 1 else max(10, query.limit // 2),
-                "what": query.title,
-                "content-type": "application/json",
-            }
-            if query.location:
-                params["where"] = query.location
-            url = f"{self.BASE}/{c}/search/1"
-            try:
-                data = self._request(url, params=params)
-                all_results.extend(data.get("results") or [])
-            except requests.HTTPError as e:
-                code = e.response.status_code if e.response is not None else None
-                if code in (401, 403):
-                    raise SourceAuthError(f"Adzuna auth failed ({code}) — check API key") from e
-                logger.warning("Adzuna fetch failed for country %s: %s", c, e)
-        return all_results[: query.limit]
+            for page in range(1, pages + 1):
+                params = {
+                    "app_id": self.app_id, "app_key": self.app_key,
+                    "results_per_page": per_page,
+                    "what": what,
+                    "content-type": "application/json",
+                }
+                if query.location and query.location.lower() not in ("remote", "worldwide"):
+                    params["where"] = query.location
+                url = f"{self.BASE}/{c}/search/{page}"
+                try:
+                    data = self._request(url, params=params)
+                    all_results.extend(data.get("results") or [])
+                except requests.HTTPError as e:
+                    code = e.response.status_code if e.response is not None else None
+                    if code in (401, 403):
+                        raise SourceAuthError(f"Adzuna auth failed ({code}) — check API key") from e
+                    logger.warning("Adzuna fetch failed for country %s page %d: %s", c, page, e)
+                    break
+        return all_results[: query.limit * 2]
 
     def _fmt_salary(self, smin, smax):
         cur = self._currency
@@ -476,17 +507,20 @@ class JSearchAdapter(SourceAdapter):
         q_text = query.title
         if query.location:
             q_text += f" in {query.location}"
-        
+
         num_pages = max(2, min(5, (query.limit + 9) // 10))
         params = {"query": q_text, "page": "1", "num_pages": str(num_pages)}
         if query.country and query.country.lower() != "all":
             params["country"] = query.country.lower()
+        wants = set(query.work_types or [])
+        if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
+            params["remote_jobs_only"] = "true"
         try:
-            resp = requests.get(self.BASE, headers=headers, params=params, timeout=15)
+            resp = requests.get(self.BASE, headers=headers, params=params, timeout=10)
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                resp = requests.get("https://jsearch.p.rapidapi.com/search", headers=headers, params=params, timeout=15)
+                resp = requests.get("https://jsearch.p.rapidapi.com/search", headers=headers, params=params, timeout=10)
                 resp.raise_for_status()
             else:
                 raise
@@ -511,7 +545,18 @@ class JSearchAdapter(SourceAdapter):
         desc = strip_html(raw.get("job_description") or "")
         
         is_remote = bool(raw.get("job_is_remote")) or "remote" in title.lower() or "remote" in location.lower() or "remote" in desc[:300].lower()
-        remote_type = REMOTE_WORLDWIDE if is_remote else ONSITE_HYBRID
+        if is_remote:
+            loc_low = location.lower()
+            has_city = bool(raw.get("job_city"))
+            has_country = bool(raw.get("job_country"))
+            if not has_city and not has_country:
+                remote_type = REMOTE_WORLDWIDE
+            elif any(k in loc_low for k in ("worldwide", "anywhere", "global", "multiple countries", "emea")):
+                remote_type = REMOTE_WORLDWIDE
+            else:
+                remote_type = REMOTE_IN_COUNTRY
+        else:
+            remote_type = ONSITE_HYBRID
         posted = (raw.get("job_posted_at_datetime_utc") or "")[:10]
 
         salary = None
@@ -596,6 +641,9 @@ class FindworkAdapter(SourceAdapter):
     def fetch(self, query):
         headers = {"Authorization": f"Token {self.api_key}", "User-Agent": USER_AGENT}
         params = {"search": query.title, "sort_by": "relevance"}
+        wants = set(query.work_types or [])
+        if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
+            params["remote"] = "true"
         resp = requests.get(self.BASE, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
@@ -625,6 +673,60 @@ class FindworkAdapter(SourceAdapter):
         )
 
 
+class TheMuseAdapter(SourceAdapter):
+    source = "themuse"
+    source_name = "The Muse"
+    BASE = "https://www.themuse.com/api/public/jobs"
+
+    def fetch(self, query):
+        # Keyless public API. Searches are token-based server-side; page through a
+        # couple of pages for volume.
+        all_results = []
+        for page in range(1, 3):
+            params = {
+                "search": query.title,
+                "page": str(page),
+                "items_per_page": 50,
+            }
+            if query.location and query.location.lower() not in ("remote", "worldwide"):
+                params["location"] = query.location
+            try:
+                data = self._request(self.BASE, params=params)
+            except Exception as e:
+                logger.warning("The Muse fetch failed page %d: %s", page, e)
+                break
+            results = data.get("results") or []
+            all_results.extend(results)
+            if not results:
+                break
+        return all_results[: query.limit * 2]
+
+    def normalize(self, raw):
+        title = (raw.get("name") or "").strip()
+        if not title:
+            return None
+        company = ((raw.get("company") or {}).get("name") or "").strip()
+        locations = [l.get("name", "") for l in raw.get("locations") or [] if l.get("name")]
+        location = ", ".join(locations) or "—"
+        remote_type = REMOTE_UNKNOWN if any("remote" in l.lower() for l in locations) else ONSITE_HYBRID
+        levels = [l.get("name", "") for l in raw.get("levels") or [] if l.get("name")]
+        seniority = (levels[0] if levels else None)
+        desc = strip_html(raw.get("contents") or "")
+        posted = (raw.get("publication_date") or "")[:10]
+        return Job(
+            title=title,
+            company=company,
+            location=location,
+            remote_type=remote_type,
+            job_type="—",
+            url=(raw.get("refs") or {}).get("landing_page") or "",
+            source=self.source, source_name=self.source_name,
+            posted_date=posted,
+            description=desc,
+            seniority=seniority,
+        )
+
+
 def default_adapters() -> list[SourceAdapter]:
     return [
         JSearchAdapter(),
@@ -633,6 +735,7 @@ def default_adapters() -> list[SourceAdapter]:
         RemotiveAdapter(),
         ArbeitnowAdapter(),
         FindworkAdapter(),
+        TheMuseAdapter(),
     ]
 
 
@@ -654,6 +757,87 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
+# ============================== URL resolution ================================
+# Aggregator redirect domains that forward to arbitrary third-party boards
+# (some of which are paywalled). We resolve these at display time so the user
+# lands on the actual vacancy/application page.
+_REDIRECT_REDUCE_SOURCES = {"adzuna", "jooble"}
+_RESOLVED_URL_CACHE: dict[str, str] = {}
+_RESOLVED_URL_LOCK = threading.Lock()
+
+
+def is_paywall_url(url: str) -> bool:
+    """True if the URL points at a known aggregator/paywall-style intermediate."""
+    if not url:
+        return True
+    low = url.lower()
+    hints = (
+        "ladders.", "jobleads.", "ziprecruiter.", "indeed.com", "glassdoor.",
+        "adzuna.", "jooble.", "simplyhired.", "monster.com", "careerbuilder.",
+        "google.com/search", "nationwidecareers",
+    )
+    return any(h in low for h in hints)
+
+
+def _resolve_apply_url(url: str, timeout: int = 6) -> str:
+    """Follow redirects and return the final destination URL (cached per URL).
+
+    Uses a light HEAD first (cheap); falls back to GET when the server rejects
+    HEAD. Any failure keeps the original URL so a click still works.
+    """
+    if not url:
+        return url
+    with _RESOLVED_URL_LOCK:
+        cached = _RESOLVED_URL_CACHE.get(url)
+    if cached:
+        return cached
+    final = url
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    for method in ("HEAD", "GET"):
+        try:
+            resp = requests.request(method, url, headers=headers, timeout=timeout,
+                                    allow_redirects=True, stream=True)
+            resp.close()
+            if resp.status_code < 400 and resp.url:
+                final = resp.url
+            break
+        except Exception:
+            continue
+    with _RESOLVED_URL_LOCK:
+        _RESOLVED_URL_CACHE[url] = final
+    return final
+
+
+def resolve_display_urls(jobs: list[Job], max_jobs: int = 40) -> list[Job]:
+    """Resolve redirect URLs for the top jobs in parallel (cheap HEAD requests).
+
+    Only touches sources known to return aggregator redirect links, keeping the
+    network cost small. Non-redirect URLs are left untouched. Mutates the passed
+    jobs in place and returns them.
+    """
+    targets = [j for j in jobs if j.source in _REDIRECT_REDUCE_SOURCES and j.url]
+    if not targets:
+        return jobs
+    targets = targets[:max_jobs]
+    with ThreadPoolExecutor(max_workers=min(len(targets), 20)) as ex:
+        futures = {ex.submit(_resolve_apply_url, j.url): j for j in targets}
+        for fut in as_completed(futures):
+            job = futures[fut]
+            try:
+                resolved = fut.result()
+            except Exception:
+                continue
+            if resolved and resolved != job.url:
+                if job.url not in job.also_on:
+                    job.also_on.insert(0, job.url)
+                job.url = resolved
+    return jobs
+
+
 # ============================== Orchestration =================================
 def _dedupe(jobs: list[Job]) -> list[Job]:
     kept: dict[str, Job] = {}
@@ -665,8 +849,16 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
         else:
             if job.source_name not in existing.also_on and job.source != existing.source:
                 existing.also_on.append(job.source_name)
-            # keep the more complete record; carry the "also_on" list forward
-            if job.completeness() > existing.completeness():
+            # Prefer the richer record; on ties prefer the non-paywall URL.
+            job_better = (
+                job.completeness() > existing.completeness()
+                or (
+                    job.completeness() == existing.completeness()
+                    and not is_paywall_url(job.url)
+                    and is_paywall_url(existing.url)
+                )
+            )
+            if job_better:
                 job.also_on = existing.also_on
                 if existing.source != job.source and existing.source_name not in job.also_on:
                     job.also_on.append(existing.source_name)
@@ -683,9 +875,72 @@ def _matches_work_type(job: Job, wanted: set[str]) -> bool:
     return False
 
 
+def _title_variants(query: SearchQuery) -> list[str]:
+    """Main query title + up to MAX_VARIANTS_PER_SOURCE aliases for recall."""
+    variants = generate_search_variants(query.title)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        v = (v or "").strip()
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            deduped.append(v)
+    return deduped[: MAX_VARIANTS_PER_SOURCE + 1] or [query.title]
+
+
+def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: float) -> tuple[list[Job], str]:
+    """Fetch a single source across search variants.
+
+    Returns (jobs, status) where status ∈ {"ok", "cached", "stale", "error", "auth"}.
+    Each variant is cached under its own key; per-request copies avoid mutating
+    the shared cache.
+    """
+    collected: list[Job] = []
+    status = "error"
+    for v_title in _title_variants(query):
+        vq = copy.copy(query)
+        vq.title = v_title
+        ckey = f"{adapter.source}:{vq.cache_key([adapter.source])}"
+        with _CACHE_LOCK:
+            cached = _CACHE.get(ckey)
+        if cached and (now - cached[0]) < ttl:
+            collected.extend(copy.deepcopy(cached[1]))
+            if status == "error":
+                status = "cached"
+            continue
+        try:
+            raw_items = adapter.fetch(vq)
+            jobs: list[Job] = []
+            for raw in raw_items:
+                try:
+                    job = adapter.normalize(raw)
+                except Exception:
+                    logger.exception("normalize failed for %s", adapter.source)
+                    continue
+                if job and job.title:
+                    jobs.append(job)
+            with _CACHE_LOCK:
+                _CACHE[ckey] = (now, jobs)
+            collected.extend(copy.deepcopy(jobs))
+            if status in ("error", "cached", "stale"):
+                status = "ok"
+        except SourceAuthError as e:
+            return collected, "auth"
+        except Exception as e:
+            with _CACHE_LOCK:
+                cached = _CACHE.get(ckey)
+            if cached:
+                collected.extend(copy.deepcopy(cached[1]))
+                if status == "error":
+                    status = "stale"
+            logger.warning("fetch failed for %s (variant %r): %s", adapter.source, v_title, e)
+    return collected, status
+
+
 def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
                 sources: Optional[list[SourceAdapter]] = None) -> dict:
-    """Fan out to enabled sources, dedupe, score (per-user), filter, sort.
+    """Fan out to enabled sources (in parallel, with search variants), dedupe,
+    score (per-user), filter, sort.
 
     Returns:
         {
@@ -699,46 +954,38 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
     ttl = _cache_ttl_seconds()
     now = time.time()
 
+    # Normalize the request: a "Remote"/"Worldwide" string typed into the Location
+    # box is really a work-type intent. Convert it and clear it so sources don't
+    # receive it as a bogus geography.
+    query = copy.copy(query)
+    if query.location and query.location.strip().lower() in ("remote", "worldwide", "anywhere", "work from home", "wfh"):
+        work_types = list(query.work_types or [])
+        if REMOTE_WORLDWIDE not in work_types:
+            work_types.append(REMOTE_WORLDWIDE)
+        query.work_types = work_types
+        query.location = ""
+
     collected: list[Job] = []
     status: dict[str, str] = {}
 
-    for adapter in adapters:
-        ckey = f"{adapter.source}:{query.cache_key([adapter.source])}"
-        with _CACHE_LOCK:
-            cached = _CACHE.get(ckey)
-        if cached and (now - cached[0]) < ttl:
-            # Work on copies — dedupe/scoring must never mutate the cached (shared) copy.
-            collected.extend(copy.deepcopy(cached[1]))
-            status[adapter.source] = "cached"
-            continue
-        try:
-            raw_items = adapter.fetch(query)
-            jobs: list[Job] = []
-            for raw in raw_items:
+    max_workers = min(len(adapters), 6)
+    if len(adapters) <= 1:
+        for adapter in adapters:
+            jobs, st = _fetch_source(adapter, query, ttl, now)
+            collected.extend(jobs)
+            status[adapter.source] = st
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_fetch_source, a, query, ttl, now): a for a in adapters}
+            for fut in as_completed(futures):
+                adapter = futures[fut]
                 try:
-                    job = adapter.normalize(raw)
-                except Exception:
-                    logger.exception("normalize failed for %s", adapter.source)
-                    continue
-                if job and job.title:
-                    jobs.append(job)
-            with _CACHE_LOCK:
-                _CACHE[ckey] = (now, jobs)                 # pristine, unscored
-            collected.extend(copy.deepcopy(jobs))      # per-request working copies
-            status[adapter.source] = "ok"
-        except SourceAuthError as e:
-            status[adapter.source] = "auth"
-            logger.warning("%s", e)
-        except Exception as e:
-            # stale-while-error: serve last good payload even past TTL
-            with _CACHE_LOCK:
-                cached = _CACHE.get(ckey)
-            if cached:
-                collected.extend(copy.deepcopy(cached[1]))
-                status[adapter.source] = "stale"
-            else:
-                status[adapter.source] = "error"
-            logger.warning("fetch failed for %s: %s", adapter.source, e)
+                    jobs, st = fut.result()
+                except Exception as e:
+                    jobs, st = [], "error"
+                    logger.warning("fetch worker failed for %s: %s", adapter.source, e)
+                collected.extend(jobs)
+                status[adapter.source] = st
 
     deduped = deduplicate_jobs(_dedupe(collected))
 
@@ -755,7 +1002,7 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
             continue
         if is_employment_type_mismatched(query.work_types, job.remote_type, job.job_type):
             continue
-        if is_location_mismatched(job.location, query.location, query.country):
+        if is_location_mismatched(job.location, query.location, query.country, job.remote_type):
             continue
         if is_resume_job_mismatched(resume_text, job.title, job.description):
             continue
@@ -790,6 +1037,10 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         filtered = [j for j in surviving_jobs if _matches_work_type(j, wanted)]
     else:
         filtered = list(surviving_jobs)
+
+    # Resolve aggregator redirect URLs (Adzuna/Jooble) so users land on the
+    # real vacancy page instead of a third-party paywall intermediate.
+    resolve_display_urls(filtered, max_jobs=30)
 
     filtered.sort(
         key=lambda j: (j.match_score if j.match_score is not None else -1, j.posted_date),

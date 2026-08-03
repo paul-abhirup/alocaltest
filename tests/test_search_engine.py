@@ -68,8 +68,11 @@ class TestTitleGuardrail(unittest.TestCase):
 
 class TestHardFilters(unittest.TestCase):
     def test_negative_keywords(self):
-        self.assertTrue(has_negative_keyword("Sales Operations Executive", "Python Developer"))
+        self.assertTrue(has_negative_keyword("Private Tutor", "Python Developer"))
         self.assertTrue(has_negative_keyword("HR Recruiter", "Software Engineer"))
+        # Sales / marketing / support are no longer auto-rejected (volume fix)
+        self.assertFalse(has_negative_keyword("Sales Operations Executive", "Python Developer"))
+        self.assertFalse(has_negative_keyword("Marketing Manager", "Marketing"))
         # If explicitly searched, negative keyword is not triggered
         self.assertFalse(has_negative_keyword("Sales Manager", "Sales Manager"))
 
@@ -152,6 +155,13 @@ class TestResumeMatch(unittest.TestCase):
         resume = "Worked as Commi Chef in busy kitchen. Responsible for food prep, cooking, menu planning, hygiene standards. Trained junior staff on kitchen safety."
         job_title = "Senior Chef Developer"
         job_desc = "Looking for a Chef Developer with CI/CD, Go, Java, SQL, Terraform."
+        # Shares the "chef" term so it is NOT hard-dropped (lenient volume fix)
+        self.assertFalse(is_resume_job_mismatched(resume, job_title, job_desc))
+
+    def test_mismatch_detects_zero_overlap(self):
+        resume = "Accounting and payroll management, financial reporting, tax filing, QuickBooks, invoicing."
+        job_title = "Backend Python Developer"
+        job_desc = "Building REST APIs with Python, Django, PostgreSQL, Docker."
         self.assertTrue(is_resume_job_mismatched(resume, job_title, job_desc))
 
     def test_mismatch_allows_same_domain(self):

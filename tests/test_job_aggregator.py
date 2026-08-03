@@ -15,7 +15,7 @@ from job_aggregator import (
     Job, SearchQuery, RemotiveAdapter, ArbeitnowAdapter, AdzunaAdapter, JSearchAdapter,
     SourceAdapter, SourceAuthError, strip_html, infer_seniority,
     _parse_required_years, _yoe_adjustment, search_jobs, clear_cache,
-    REMOTE_WORLDWIDE, REMOTE_UNKNOWN, ONSITE_HYBRID, CONTRACT,
+    REMOTE_WORLDWIDE, REMOTE_UNKNOWN, REMOTE_IN_COUNTRY, ONSITE_HYBRID, CONTRACT,
 )
 from search_engine.title_match import compute_title_similarity, is_title_relevant as se_is_title_relevant
 from search_engine.ranking.freshness import score_freshness
@@ -166,7 +166,12 @@ class TestNormalize(unittest.TestCase):
 
     def test_remotive_unknown_location(self):
         raw = dict(REMOTIVE_RAW, candidate_required_location="USA")
-        self.assertEqual(RemotiveAdapter().normalize(raw).remote_type, REMOTE_UNKNOWN)
+        # A named country means country-restricted remote → in-country, not worldwide
+        self.assertEqual(RemotiveAdapter().normalize(raw).remote_type, REMOTE_IN_COUNTRY)
+
+    def test_remotive_worldwide_location(self):
+        raw = dict(REMOTIVE_RAW, candidate_required_location="worldwide")
+        self.assertEqual(RemotiveAdapter().normalize(raw).remote_type, REMOTE_WORLDWIDE)
 
     def test_remotive_missing_title(self):
         self.assertIsNone(RemotiveAdapter().normalize({"title": ""}))
@@ -205,7 +210,8 @@ class TestNormalize(unittest.TestCase):
         self.assertEqual(j.title, "Python Developer")
         self.assertEqual(j.company, "Tech Corp")
         self.assertEqual(j.location, "San Francisco, US")
-        self.assertEqual(j.remote_type, REMOTE_WORLDWIDE)
+        # Remote job tied to a specific country is in-country, not worldwide
+        self.assertEqual(j.remote_type, REMOTE_IN_COUNTRY)
         self.assertEqual(j.posted_date, "2026-07-20")
         self.assertEqual(j.salary, "$120,000–$150,000")
         self.assertEqual(j.job_type, "Fulltime")

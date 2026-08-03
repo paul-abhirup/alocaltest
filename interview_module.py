@@ -265,6 +265,17 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
         cat1_section = picked[:cat1_count]
         resume_section = picked[cat1_count:cat1_count + res_count]
 
+        # Demo answers are generic placeholders; nudge users to ground them in
+        # their own CV facts (real AI answers are already CV-personalized).
+        if resume_part and resume_part.strip():
+            _demo_pers_note = (
+                "\n\n[💡 Personalise me: rewrite with a specific project, role, "
+                "or metric from YOUR CV so this reads like your own answer.]"
+            )
+            for _dq in picked:
+                if _dq.get("ideal_answer"):
+                    _dq["ideal_answer"] = _dq["ideal_answer"] + _demo_pers_note
+
         if is_technical_type:
             demo = {"technical": cat1_section, "resume": resume_section}
         else:
@@ -667,10 +678,21 @@ ADDITIONAL REQUIREMENTS:
 - Do NOT include numbering inside question text.
 - If the JD or resume is thin, infer reasonable questions based on what IS provided — never fill with generic questions.
 
+PERSONALIZATION — EVERY ideal_answer MUST be grounded in the candidate's RESUME:
+- Write every ideal_answer in FIRST PERSON, in the candidate's voice, as a strong example answer they could give.
+- Base it on the candidate's ACTUAL roles, companies, projects, technologies, skills, and achievements listed in the RESUME below.
+- Every answer MUST reference at least one specific item from the resume (a role, company, project, tool, metric, or accomplishment).
+- Tie the candidate's resume experience directly to the job description: show how their past work maps to what this job asks for.
+- Structure behavioral answers using STAR (Situation, Task, Action, Result), filling in specifics from the resume.
+- For technical questions, the answer must describe how the candidate has actually used the relevant tool/concept in their resume projects/roles, plus best practice.
+- If the resume lacks a specific fact the answer needs (e.g. an exact metric, team size, or technology), write the example with a clearly-marked placeholder in SQUARE BRACKETS, e.g. "[e.g. reduced query latency by 40%]" or "[e.g. a 6-person team]", so the user can fill in their real number.
+- NEVER write a generic model answer that ignores the resume. The answer must read like this specific candidate's own strong answer.
+- The answer should be a "leading" answer the user can copy, edit, or expand — not a vague suggestion.
+
 JOB DESCRIPTION (must anchor EVERY question):
 {job_description}
 
-RESUME (for resume-specific questions):
+RESUME (grounding source for the PERSONALIZED example answers above):
 {resume_text}
 """
 
@@ -2059,6 +2081,9 @@ def _phase_f2f(export_qa_fn=None):
                 end_f2f_session(session_id)
             st.rerun()
 
+    # ── CV-personalized example answer (copy / edit / expand) ────────────────
+    _render_example_answer(q_obj, typed_key, show_draft_button=True, idx=idx)
+
     if st.session_state.get("f2f_results"):
         with st.expander(f"📋 Answered so far — {len(st.session_state['f2f_results'])}", expanded=False):
             for i, r in enumerate(st.session_state["f2f_results"]):
@@ -2091,6 +2116,37 @@ def _f2f_submit_answer(q_obj: dict, answer: str, session_id):
     st.session_state.f2f_results = results
     st.session_state.f2f_idx = st.session_state.get("f2f_idx", 0) + 1
     st.rerun()
+
+
+def _use_example_as_draft(typed_key, example_answer):
+    """Pre-fill the typed-answer box with the CV-personalized example answer.
+
+    Must run as an on_click callback so the state is set before the widget is
+    instantiated on the next rerun (Streamlit constraint).
+    """
+    try:
+        st.session_state[typed_key] = example_answer
+    except Exception:
+        pass
+
+
+def _render_example_answer(q_obj, typed_key, show_draft_button=True, idx=None):
+    """Render the 'Example Answer (from your CV)' panel for a question."""
+    example_answer = q_obj.get("ideal_answer", "") or ""
+    if not example_answer:
+        return
+    with st.expander("💡 Example Answer (from your CV)", expanded=False):
+        st.markdown(
+            "<small><em>A strong, personalised answer based on your resume. "
+            "Copy it, edit it, or expand on it.</em></small>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(example_answer)
+        if show_draft_button and typed_key:
+            label = "📋 Use as my starting draft"
+            key = f"use_draft_{idx}" if idx is not None else f"use_draft_{typed_key}"
+            if st.button(label, key=key):
+                _use_example_as_draft(typed_key, example_answer)
 
 
 def _phase_session():
@@ -2134,6 +2190,7 @@ def _phase_session():
     section = q_obj["section"].title()
     difficulty = q_obj["difficulty"]
     question_text = q_obj["question"]
+    typed_key = f"typed_answer_{idx}"
 
     # Difficulty badge color
     diff_colors = {"Simple": "#10b981", "Easy": "#10b981", "Medium": "#f59e0b", "Hard": "#f59e0b", "Very Hard": "#ef4444"}
@@ -2169,7 +2226,6 @@ def _phase_session():
         st.markdown("#### ✍️ Your Answer")
 
         voice_key = f"voice_answer_{idx}"
-        typed_key = f"typed_answer_{idx}"
 
         tab_type, tab_voice = st.tabs(["⌨️ Type Answer", "🎙️ Speak Answer"])
 
@@ -2220,6 +2276,14 @@ def _phase_session():
         st.markdown("*Cover these concepts in your answer to score higher:*")
         for kp in q_obj.get("key_points", []):
             st.markdown(f"• {kp}")
+
+    # ── CV-personalized example answer (copy / edit / expand) ────────────────
+    _render_example_answer(
+        q_obj,
+        typed_key,
+        show_draft_button=not st.session_state.interview_show_feedback,
+        idx=idx,
+    )
 
     # ── Previous results quick view ───────────────────────────────────────────
     if st.session_state.interview_session_results:

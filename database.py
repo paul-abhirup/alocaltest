@@ -577,6 +577,60 @@ def _init_db_once():
         )
     """)
 
+    # Persisted login sessions (refresh-safe auth). The raw token is stored in a
+    # browser cookie; only its sha256 hash is stored here. Expired rows are
+    # purged lazily at app startup. user_email is intentionally NOT a foreign key:
+    # business accounts live in business_users, not users.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token_hash VARCHAR(64) PRIMARY KEY,
+            user_email VARCHAR(255) NOT NULL,
+            account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP NOT NULL
+        )
+    """)
+    # Migration: drop the users FK on databases created before business support.
+    cursor.execute("""
+        ALTER TABLE auth_sessions DROP CONSTRAINT IF EXISTS auth_sessions_user_email_fkey
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_email ON auth_sessions(user_email)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)
+    """)
+
+    # Voucher codes (admin-generated) and their redemption history.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vouchers (
+            code VARCHAR(32) PRIMARY KEY,
+            plan VARCHAR(50) NOT NULL DEFAULT 'Voucher Pro',
+            duration_days INTEGER NOT NULL DEFAULT 30,
+            max_redemptions INTEGER NOT NULL DEFAULT 1,
+            redeemed_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMP,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            created_by VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            note TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status)
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS voucher_redemptions (
+            id SERIAL PRIMARY KEY,
+            voucher_code VARCHAR(32) NOT NULL REFERENCES vouchers(code) ON DELETE CASCADE,
+            user_email VARCHAR(255) NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+            redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (voucher_code, user_email)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_voucher_red_user ON voucher_redemptions(user_email)
+    """)
 
 
 
@@ -648,6 +702,204 @@ def create_user(email, name, auth_provider, password_hash=None):
     conn.close()
     
     return user
+
+
+def create_auth_session(token_hash, user_email, account_type="individual", duration_days=30):
+    """Store a hashed auth token for a persisted login session."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    expires_at = datetime.now() + timedelta(days=duration_days)
+    try:
+        cursor.execute("""
+            INSERT INTO auth_sessions (token_hash, user_email, account_type, expires_at)
+            VALUES (%s, %s, %s, %s)
+        """, (token_hash, user_email, account_type, expires_at))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_auth_session(token_hash):
+    """Return the active session row (or None) for a token hash."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("""
+            SELECT * FROM auth_sessions
+            WHERE token_hash = %s AND expires_at > NOW()
+        """, (token_hash,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_auth_session(token_hash):
+    """Revoke a persisted session token."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (token_hash,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def purge_expired_auth_sessions():
+    """Delete expired persisted sessions (called lazily at app startup)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM auth_sessions WHERE expires_at <= NOW()")
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def create_voucher(code, plan, duration_days, max_redemptions, expires_at, created_by, note):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO vouchers (code, plan, duration_days, max_redemptions,
+                                  expires_at, created_by, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING code
+            """,
+            (code, plan, duration_days, max_redemptions, expires_at, created_by, note),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+    return code
+
+
+def get_voucher(code):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT * FROM vouchers WHERE code=%s", (code,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def list_vouchers():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT * FROM vouchers ORDER BY created_at DESC")
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def revoke_voucher(code):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE vouchers SET status='revoked' WHERE code=%s", (code,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def redeem_voucher_atomic(code, email):
+    """Atomically reserve a voucher redemption.
+
+    Locks the voucher row, checks the cap, ensures the user has not already
+    redeemed it, increments redeemed_count, inserts the redemption row, and
+    returns the voucher. The caller activates the plan separately so that any
+    failure during purchase_plan rolls back cleanly via the surrounding
+    transaction.
+
+    Returns the voucher dict on success, or {"error": reason} on rejection.
+    """
+    email = email.strip().lower()
+    conn = get_db_connection()
+    try:
+        with conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("SELECT * FROM vouchers WHERE code=%s FOR UPDATE", (code,))
+            v = cur.fetchone()
+            if not v:
+                return {"error": "not_found"}
+            v = dict(v)
+            if v["status"] != "active":
+                return {"error": "inactive"}
+            if v["expires_at"] is not None and v["expires_at"] <= datetime.now():
+                return {"error": "expired"}
+            if v["redeemed_count"] >= v["max_redemptions"]:
+                return {"error": "max_redemptions"}
+            cur.execute(
+                "SELECT 1 FROM voucher_redemptions WHERE voucher_code=%s AND user_email=%s",
+                (code, email),
+            )
+            if cur.fetchone():
+                return {"error": "already_redeemed"}
+            cur.execute(
+                """
+                UPDATE vouchers SET redeemed_count = redeemed_count + 1
+                 WHERE code=%s
+                """,
+                (code,),
+            )
+            cur.execute(
+                """
+                INSERT INTO voucher_redemptions (voucher_code, user_email)
+                VALUES (%s, %s)
+                """,
+                (code, email),
+            )
+            return v
+    finally:
+        release_db_connection(conn)
+
+
+def list_voucher_redemptions(code=None, email=None, limit=50):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if code:
+            cursor.execute(
+                """
+                SELECT * FROM voucher_redemptions
+                 WHERE voucher_code=%s
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (code, int(limit)),
+            )
+        elif email:
+            cursor.execute(
+                """
+                SELECT * FROM voucher_redemptions
+                 WHERE user_email=%s
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (email, int(limit)),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM voucher_redemptions
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (int(limit),),
+            )
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def create_business_user(

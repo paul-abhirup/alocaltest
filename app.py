@@ -35,6 +35,24 @@ from templates import apply_template
 from utils import optimize_keywords, enforce_page_limit, get_gemini_response, get_all_country_dial_codes
 from interview_module import show_interview_practice_page, _init_session as _init_interview_session
 import pricing
+import extra_streamlit_components as stx
+from session_auth import (
+    issue_session,
+    validate_session,
+    revoke_session,
+    purge_expired_sessions,
+    SESSION_COOKIE_NAME,
+)
+import voucher_engine
+from voucher_engine import (
+    is_admin as is_voucher_admin,
+    generate_voucher,
+    redeem_voucher,
+    list_vouchers as list_all_vouchers,
+    list_voucher_redemptions,
+    revoke_voucher as admin_revoke_voucher,
+    DEFAULT_PLAN as VOUCHER_DEFAULT_PLAN,
+)
 from credit_engine import (
     wallet_balance,
     spend_credits,
@@ -388,9 +406,80 @@ def auto_save_progress():
             # Silently handle auto-save errors to not interrupt user flow
             pass
 
+
+_cvolve_cookie_mgr = None
+
+
+def _cookie_manager():
+    """Lazily-instantiated singleton CookieManager component."""
+    global _cvolve_cookie_mgr
+    if _cvolve_cookie_mgr is None:
+        _cvolve_cookie_mgr = stx.CookieManager(key="cvolve_cookie_mgr")
+    return _cvolve_cookie_mgr
+
+
+def _persist_login_cookie(raw_token):
+    """Write the session token to a 30-day browser cookie (refresh-safe)."""
+    if not raw_token:
+        return
+    try:
+        _cookie_manager().set(
+            SESSION_COOKIE_NAME, raw_token, max_age=60 * 60 * 24 * 30
+        )
+    except Exception:
+        pass
+
+
+def restore_session_from_cookie():
+    """Re-hydrate the logged-in session from the persisted auth cookie.
+
+    Streamlit wipes st.session_state on every refresh, which is why users were
+    logged out. This reads the cookie set at login, validates the token against
+    the auth_sessions table, and repopulates the session before the login gate.
+    """
+    if st.session_state.get("user_data"):
+        return
+    try:
+        cm = _cookie_manager()
+        cookies = cm.get_all()
+        if cookies is None:
+            # The cookie component hasn't mounted yet this session; one extra
+            # run lets the browser deliver the cookie for reading.
+            if "cvolve_cookie_retried" not in st.session_state:
+                st.session_state.cvolve_cookie_retried = True
+                st.rerun()
+            return
+        raw = cookies.get(SESSION_COOKIE_NAME)
+        if not raw:
+            return
+        data = validate_session(raw)
+        if not data:
+            try:
+                cm.delete(SESSION_COOKIE_NAME)
+            except Exception:
+                pass
+            return
+        user = data["user"]
+        st.session_state.user_data = user
+        st.session_state.account_type = data["account_type"]
+        if data["account_type"] == "business":
+            st.session_state.business_user = user
+            st.session_state.business_logged_in = True
+    except Exception:
+        pass
+
+
 def main():
 
     handle_stripe_return_globally()
+
+    # Lazy-cleanup expired persisted sessions (once per process)
+    if not st.session_state.get("_sessions_purged"):
+        purge_expired_sessions()
+        st.session_state._sessions_purged = True
+
+    # ✅ Restore login from cookie (refresh-safe persistence)
+    restore_session_from_cookie()
 
     # ✅ Persist page navigation (login/register/main)
     if "page" not in st.session_state:
@@ -450,6 +539,18 @@ def main():
         show_billing_page()
         if st.button("⬅ Back"):
             st.session_state.page = "home"   # any non-"billing" value works
+            st.rerun()
+        return
+
+    # Admin-only Voucher management page
+    if st.session_state.get("page") == "admin_vouchers":
+        if not is_voucher_admin(current_user.get("email", "")):
+            st.error("You don't have access to this page.")
+            return
+        st.markdown("## 🎫 Admin · Voucher Management")
+        show_admin_vouchers_page(current_user.get("email", ""))
+        if st.button("⬅ Back"):
+            st.session_state.page = "home"
             st.rerun()
         return
 
@@ -534,8 +635,23 @@ def main():
             st.session_state.page = "billing"
             st.rerun()
 
-            
+        # Admin-only: Voucher management
+        if is_voucher_admin(current_user.get("email", "")):
+            if st.sidebar.button("🎫 Admin · Vouchers"):
+                st.session_state.page = "admin_vouchers"
+                st.rerun()
+
+
         if st.sidebar.button("Logout"):
+
+            # Revoke persisted session + clear cookie so refresh stays logged out
+            try:
+                raw = _cookie_manager().get(SESSION_COOKIE_NAME)
+                if raw:
+                    revoke_session(raw)
+                _cookie_manager().delete(SESSION_COOKIE_NAME)
+            except Exception:
+                pass
 
             # Individual session
             st.session_state.logged_in = False
@@ -573,7 +689,7 @@ def main():
         
         # Sidebar Resume Upload (global)
         st.markdown("---")
-        st.markdown("### 📄 Master Resume / CV")
+        st.markdown("### 📄 Resume / CV")
         sidebar_cv = st.file_uploader(
             "Upload CV (PDF/DOCX)",
             type=["pdf", "docx"],
@@ -634,6 +750,20 @@ def main():
             extract_resume_fn=extract_resume_text,
             export_qa_fn=export_interview_qa,
         )
+
+def _apply_domain_label(url: str) -> str:
+    """Return a short destination-domain label for the apply button."""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host[:40]
+    except Exception:
+        return ""
+
 
 def _render_job_results_unified(result, resume_text):
     """Render the search result stored in session with 1-click optimization button."""
@@ -751,7 +881,9 @@ def _render_job_results_unified(result, resume_text):
                             st.rerun()
 
                 if j.url:
-                    st.link_button("View / Apply on Source", j.url)
+                    domain = _apply_domain_label(j.url)
+                    btn_label = f"View / Apply on {domain} ↗" if domain else "View / Apply on Source ↗"
+                    st.link_button(btn_label, j.url)
 
             with col_src:
                 also = f" (also on {', '.join(j.also_on)})" if j.also_on else ""
@@ -803,6 +935,7 @@ def show_login_page():
                 if user:
                     st.session_state.user_data = user
                     st.session_state.account_type = "individual"
+                    _persist_login_cookie(issue_session(email_norm, "individual"))
                     st.success("✅ Login successful!")
                     st.rerun()
                 else:
@@ -864,6 +997,8 @@ def show_business_login_page():
                 st.session_state.business_email = user["email"]
                 st.session_state.business_company = user["company_name"]
                 st.session_state.account_type = "business"
+
+                _persist_login_cookie(issue_session(user["email"], "business"))
 
                 st.success("Business Login Successful")
 
@@ -1436,7 +1571,9 @@ def _render_application_suite(email: str, resume_text: str, jd_to_use: str, titl
     with col_apply:
         active_url = st.session_state.get("active_job_url")
         if active_url:
-            st.link_button("🚀 View / Apply on Source", active_url, use_container_width=True)
+            domain = _apply_domain_label(active_url)
+            btn_label = f"🚀 View / Apply on {domain} ↗" if domain else "🚀 View / Apply on Source ↗"
+            st.link_button(btn_label, active_url, use_container_width=True)
         else:
             st.button("🚀 View / Apply on Source", disabled=True, use_container_width=True)
 
@@ -2097,6 +2234,119 @@ def show_analytics_page():
         st.write("No recent generations found.")
 
 
+def show_admin_vouchers_page(admin_email):
+    """Admin-only voucher management UI: generate, list/revoke, view redemptions."""
+    from datetime import datetime as _dt
+
+    # ── Generate a new voucher ───────────────────────────────────────────────
+    st.markdown("#### ➕ Generate voucher")
+    with st.form("generate_voucher_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            duration_days = st.number_input(
+                "Duration (days)", min_value=1, max_value=365,
+                value=voucher_engine.DEFAULT_DURATION_DAYS, step=1,
+            )
+            max_redemptions = st.number_input(
+                "Max redemptions", min_value=1, max_value=1000,
+                value=voucher_engine.DEFAULT_MAX_REDEMPTIONS, step=1,
+            )
+        with c2:
+            plan_choice = st.selectbox("Plan", options=[voucher_engine.DEFAULT_PLAN], index=0)
+            expires_at_input = st.date_input("Expires on (optional)", value=None)
+        with c3:
+            note = st.text_input("Note (optional)", placeholder="e.g. Marketing — July cohort")
+        submitted = st.form_submit_button("Generate", use_container_width=True)
+
+    if submitted:
+        try:
+            expires_at = (
+                _dt.combine(expires_at_input, _dt.min.time())
+                if expires_at_input else None
+            )
+            v = generate_voucher(
+                plan=plan_choice,
+                duration_days=int(duration_days),
+                max_redemptions=int(max_redemptions),
+                expires_at=expires_at,
+                created_by=admin_email,
+                note=note or None,
+            )
+            st.success(
+                f"✅ Created **`{v['code']}`** — {v['plan']}, "
+                f"{v['duration_days']} days, {v['max_redemptions']} redemption(s)."
+            )
+            st.info("📋 Copy the code above and share it with the selected user.")
+        except Exception as e:
+            st.error(f"❌ Could not create voucher: {e}")
+
+    # ── List + revoke vouchers ───────────────────────────────────────────────
+    st.markdown("#### 📋 Vouchers")
+    try:
+        rows = list_all_vouchers()
+    except Exception as e:
+        st.error(f"Could not load vouchers: {e}")
+        return
+
+    if not rows:
+        st.info("No vouchers yet.")
+    else:
+        for v in rows:
+            with st.container(border=True):
+                col_info, col_action = st.columns([5, 1])
+                with col_info:
+                    expires = v.get("expires_at")
+                    expires_str = expires.strftime("%Y-%m-%d") if expires else "—"
+                    created = v.get("created_at")
+                    created_str = created.strftime("%Y-%m-%d") if created else "—"
+                    st.markdown(
+                        f"**`{v['code']}`** · {v['plan']} · "
+                        f"**{v['redeemed_count']}/{v['max_redemptions']}** redemptions · "
+                        f"expires {expires_str} · status: `{v['status']}`"
+                    )
+                    meta = []
+                    if v.get("note"):
+                        meta.append(f"📝 {v['note']}")
+                    if v.get("created_by"):
+                        meta.append(f"Created by {v['created_by']} on {created_str}")
+                    if meta:
+                        st.caption(" · ".join(meta))
+                with col_action:
+                    if v["status"] == "active":
+                        if st.button("Revoke", key=f"revoke_{v['code']}", use_container_width=True):
+                            try:
+                                admin_revoke_voucher(v["code"])
+                                st.success(f"Revoked {v['code']}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+    # ── Redemption history ───────────────────────────────────────────────────
+    st.markdown("#### 👥 Redemption history")
+    try:
+        reds = list_voucher_redemptions(limit=200)
+    except Exception as e:
+        st.error(f"Could not load redemptions: {e}")
+        return
+
+    if not reds:
+        st.info("No redemptions yet.")
+        return
+
+    codes = sorted({r["voucher_code"] for r in reds})
+    code_filter = st.selectbox("Filter by code", options=["(all)"] + codes)
+    view = reds if code_filter == "(all)" else [r for r in reds if r["voucher_code"] == code_filter]
+    st.dataframe(
+        [{
+            "Code": r["voucher_code"],
+            "Email": r["user_email"],
+            "When": r["redeemed_at"].strftime("%Y-%m-%d %H:%M") if r.get("redeemed_at") else "—",
+        } for r in view],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def show_billing_page():
     """Billing and subscription management with Stripe + simple currency selection"""
 
@@ -2611,10 +2861,55 @@ def show_billing_page():
                 )
                 st.stop()
 
+        # ── Voucher redemption (Voucher Pro — 1 month, no F2F) ───────────────
+        st.markdown("### 🎫 Have a voucher code?")
+        st.caption(
+            "Selected users get 1 month of full platform access via a voucher code. "
+            "Live voice interview (ElevenLabs) is excluded; everything else is included."
+        )
+        v1, v2 = st.columns([3, 1])
+        with v1:
+            voucher_input = st.text_input(
+                "Voucher code",
+                key="voucher_code_input",
+                placeholder="CV-XXXX-XXXX",
+            )
+        with v2:
+            redeem_clicked = st.button("Redeem", key="redeem_voucher_btn")
+        voucher_msg = st.empty()
+
+        if redeem_clicked and voucher_input:
+            result = redeem_voucher(voucher_input.strip(), user_email)
+            if result.get("ok"):
+                voucher_msg.success(
+                    f"✅ Voucher redeemed! {result['plan']} activated for "
+                    f"{result['duration_days']} days ({result['credits']} credits)."
+                )
+                try:
+                    reset_credits_if_expired(user_email)
+                except Exception:
+                    pass
+                st.rerun()
+            else:
+                reason = result.get("reason", "unknown")
+                friendly = {
+                    "not_found": "This code doesn't exist. Please double-check.",
+                    "inactive": "This voucher has been revoked.",
+                    "expired": "This voucher has expired.",
+                    "max_redemptions": "This voucher has reached its redemption limit.",
+                    "already_redeemed": "You've already redeemed this code.",
+                    "missing_code_or_email": "Please enter a code.",
+                    "plan_activation_failed": "Could not activate the plan. Please contact support.",
+                }.get(reason, f"Could not redeem (reason: {reason}).")
+                voucher_msg.error(f"❌ {friendly}")
+
         phone = (st.session_state.get("user_data", {}).get("phone") or "").strip()
         is_india_user = phone.startswith("+91")
 
         for plan_name, cfg in pricing.PLANS.items():
+            # Voucher-only plans aren't user-buyable — activated via redemption above.
+            if cfg.get("voucher_only"):
+                continue
             price_usd = cfg["price_usd"]
 
             special_discount = get_user_special_discount(

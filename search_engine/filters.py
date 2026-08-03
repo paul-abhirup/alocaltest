@@ -97,13 +97,17 @@ def is_employment_type_mismatched(wanted_work_types: list[str], job_remote_type:
     return False
 
 
-def is_location_mismatched(job_location: str, query_location: str = "", query_country: str = "") -> bool:
+def is_location_mismatched(job_location: str, query_location: str = "", query_country: str = "", job_remote_type: str = "") -> bool:
     """Phase 7: Reject jobs located in a different country/region than requested (unless Worldwide Remote)."""
     if not query_country and not query_location:
         return False
 
     q_country = (query_country or "").lower().strip()
     if q_country == "all":
+        return False
+
+    # Worldwide-remote jobs match ANY requested location — never drop them here.
+    if "worldwide" in (job_remote_type or "").lower():
         return False
 
     loc_low = (job_location or "").lower().strip()

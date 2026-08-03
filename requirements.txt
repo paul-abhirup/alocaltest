@@ -6,6 +6,7 @@
 
 # --- Web UI (Streamlit app: app.py) ---
 streamlit>=1.32.0,<2.0.0
+extra-streamlit-components>=0.1.54,<1.0.0
 
 # --- REST API (api_server.py) ---
 fastapi>=0.110.0,<1.0.0

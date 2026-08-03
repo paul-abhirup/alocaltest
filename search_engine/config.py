@@ -4,8 +4,8 @@ Avoids magic numbers and hardcoded strings across the search pipeline.
 """
 
 # Hard thresholds
-TITLE_SIMILARITY_THRESHOLD = 40.0   # Reject job immediately if title similarity < 40%
-MAX_JOB_AGE_DAYS = 45               # Discard jobs posted > 45 days ago
+TITLE_SIMILARITY_THRESHOLD = 30.0   # Reject job immediately if title similarity < 30%
+MAX_JOB_AGE_DAYS = 90               # Discard jobs posted > 90 days ago
 MIN_DESC_LENGTH_FOR_CONFIDENCE = 200 # Short descriptions get lower confidence
 
 # Composite scoring weights (must sum to 1.0)
@@ -19,11 +19,11 @@ DEFAULT_WEIGHTS = {
     "description_quality": 0.03,
 }
 
-# Negative keywords: Automatically reject titles containing these words unless user explicitly searched for them
+# Negative keywords: Automatically reject titles containing these words unless user explicitly searched for them.
+# Kept focused on education/recruiting roles that don't fit the platform's job-match intent.
 DEFAULT_NEGATIVE_KEYWORDS = {
     "faculty", "trainer", "teacher", "tutor", "counsellor", "counselor",
-    "sales", "marketing", "recruiter", "hr", "business development",
-    "customer support", "call center", "telecaller"
+    "recruiter", "hr", "business development",
 }
 
 # Synonyms and abbreviations for query normalization

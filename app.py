@@ -35,7 +35,10 @@ from templates import apply_template
 from utils import optimize_keywords, enforce_page_limit, get_gemini_response, get_all_country_dial_codes
 from interview_module import show_interview_practice_page, _init_session as _init_interview_session
 import pricing
-import extra_streamlit_components as stx
+try:
+    import extra_streamlit_components as stx
+except Exception:
+    stx = None
 from session_auth import (
     issue_session,
     validate_session,
@@ -413,6 +416,8 @@ _cvolve_cookie_mgr = None
 def _cookie_manager():
     """Lazily-instantiated singleton CookieManager component."""
     global _cvolve_cookie_mgr
+    if stx is None:
+        return None
     if _cvolve_cookie_mgr is None:
         _cvolve_cookie_mgr = stx.CookieManager(key="cvolve_cookie_mgr")
     return _cvolve_cookie_mgr
@@ -423,9 +428,11 @@ def _persist_login_cookie(raw_token):
     if not raw_token:
         return
     try:
-        _cookie_manager().set(
-            SESSION_COOKIE_NAME, raw_token, max_age=60 * 60 * 24 * 30
-        )
+        cm = _cookie_manager()
+        if cm:
+            cm.set(
+                SESSION_COOKIE_NAME, raw_token, max_age=60 * 60 * 24 * 30
+            )
     except Exception:
         pass
 
@@ -441,6 +448,8 @@ def restore_session_from_cookie():
         return
     try:
         cm = _cookie_manager()
+        if not cm:
+            return
         cookies = cm.get_all()
         if cookies is None:
             # The cookie component hasn't mounted yet this session; one extra
@@ -646,10 +655,12 @@ def main():
 
             # Revoke persisted session + clear cookie so refresh stays logged out
             try:
-                raw = _cookie_manager().get(SESSION_COOKIE_NAME)
-                if raw:
-                    revoke_session(raw)
-                _cookie_manager().delete(SESSION_COOKIE_NAME)
+                cm = _cookie_manager()
+                if cm:
+                    raw = cm.get(SESSION_COOKIE_NAME)
+                    if raw:
+                        revoke_session(raw)
+                    cm.delete(SESSION_COOKIE_NAME)
             except Exception:
                 pass
 
@@ -763,6 +774,23 @@ def _apply_domain_label(url: str) -> str:
         return host[:40]
     except Exception:
         return ""
+
+
+def _to_numeric(val):
+    """Safely coerce a value to an int percentage.
+
+    Handles None, int, float, plain numeric strings ("67"), and percentage
+    strings ("67%") without raising. Returns 0 for unparseable values.
+    """
+    if val is None:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().rstrip('%')
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
 
 
 def _render_job_results_unified(result, resume_text):
@@ -1138,15 +1166,15 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
             with st.container(border=True):
                 col1, col2 = st.columns(2)
                 with col1:
-                    score_val = analysis['score'] if analysis['score'] is not None else 0
+                    score_val = _to_numeric(analysis.get('score'))
                     st.metric("General ATS Compatibility", f"{score_val}%")
-                    st.progress(min(1.0, max(0.0, float(score_val) / 100.0)))
+                    st.progress(min(1.0, max(0.0, score_val / 100.0)))
                     if score_val < 40:
                         st.warning("⚠️ Your baseline resume ATS formatting is critically low.")
                 with col2:
-                    kw_val = analysis['keyword_match'] if analysis['keyword_match'] is not None else 0
+                    kw_val = _to_numeric(analysis.get('keyword_match'))
                     st.metric("Keyword Structure Match", f"{kw_val}%")
-                    st.progress(min(1.0, max(0.0, float(kw_val) / 100.0)))
+                    st.progress(min(1.0, max(0.0, kw_val / 100.0)))
 
                 if analysis.get('suggestions'):
                     st.markdown("### 💡 Improvement Suggestions")
@@ -1405,13 +1433,13 @@ def _show_manual_jd_mode(email: str):
                 with st.container(border=True):
                     col1, col2 = st.columns(2)
                     with col1:
-                        score_val = analysis['score'] if analysis['score'] is not None else 0
+                        score_val = _to_numeric(analysis.get('score'))
                         st.metric("General ATS Compatibility", f"{score_val}%")
-                        st.progress(min(1.0, max(0.0, float(score_val) / 100.0)))
+                        st.progress(min(1.0, max(0.0, score_val / 100.0)))
                     with col2:
-                        kw_val = analysis['keyword_match'] if analysis['keyword_match'] is not None else 0
+                        kw_val = _to_numeric(analysis.get('keyword_match'))
                         st.metric("Keyword Structure Match", f"{kw_val}%")
-                        st.progress(min(1.0, max(0.0, float(kw_val) / 100.0)))
+                        st.progress(min(1.0, max(0.0, kw_val / 100.0)))
                     if analysis.get('suggestions'):
                         st.markdown("#### 💡 Improvement Suggestions")
                         for sug in analysis['suggestions']:
@@ -1432,26 +1460,44 @@ def _show_manual_jd_mode(email: str):
         with head_l:
             target_disp = f" **{st.session_state.manual_title}**"
             st.markdown(f"### ⚡ Step 3: Boost Your Match Before Generating{target_disp}")
-            st.caption(
-                "We identified a few requirements where your resume shows no or weak evidence. "
-                "Answer any that apply using your real experience — we'll weave your verified answers straight into the generated resume!"
-            )
+            if not gaps:
+                st.caption(
+                    "Your resume already covers this job description well — no gaps were "
+                    "identified. You can proceed straight to generating the optimized CV."
+                )
+            else:
+                st.caption(
+                    "We identified a few requirements where your resume shows no or weak evidence. "
+                    "Answer any that apply using your real experience — we'll weave your verified answers straight into the generated resume!"
+                )
         with head_r:
             if overall is not None:
                 st.metric("Current JD Match", f"{overall}%")
 
         answers = {}
-        for gap in gaps:
-            with st.container(border=True):
-                st.markdown(f"**{gap.get('area', '')}**")
-                if gap.get("why"):
-                    st.caption(f"Why this matters: {gap['why']}")
-                val = st.text_area(
-                    gap.get("question", "Tell us more:"),
-                    key=f"gap_manual_{gap.get('id', gap.get('area', ''))}"
+        if not gaps:
+            if gap_result.get("sufficient"):
+                st.success(
+                    "✅ Great news — your resume already covers this job description well. "
+                    "No additional questions needed; proceed to generate your optimized CV."
                 )
-                if val.strip():
-                    answers[gap.get("area", "")] = val.strip()
+            else:
+                st.info(
+                    "ℹ️ No specific gaps were identified for this job description. "
+                    "Proceed to generate your optimized CV."
+                )
+        else:
+            for gap in gaps:
+                with st.container(border=True):
+                    st.markdown(f"**{gap.get('area', '')}**")
+                    if gap.get("why"):
+                        st.caption(f"Why this matters: {gap['why']}")
+                    val = st.text_area(
+                        gap.get("question", "Tell us more:"),
+                        key=f"gap_manual_{gap.get('id', gap.get('area', ''))}"
+                    )
+                    if val.strip():
+                        answers[gap.get("area", "")] = val.strip()
 
         st.markdown("---")
         st.markdown("#### ⚖️ Accuracy Acknowledgment & Disclaimer")
@@ -1972,13 +2018,17 @@ def show_smart_job_match_page():
                 cv_clean = _sanitize_db_text(st.session_state.cv_preview)
 
                 metadata = st.session_state.get("cv_optimization_metadata") or {}
-                ats_score_val = metadata.get("ats_score")
-                if ats_score_val is None:
+                raw_ats = metadata.get("ats_score")
+                if raw_ats is not None:
+                    ats_score_val = _to_numeric(raw_ats)
+                else:
                     from utils import optimize_keywords
                     quick_analysis = optimize_keywords(cv_clean, jd_clean)
-                    ats_score_val = int(float(quick_analysis.get("score") or target_match_val))
-                else:
-                    ats_score_val = int(ats_score_val)
+                    raw_score = quick_analysis.get("score")
+                    ats_score_val = (
+                        _to_numeric(raw_score) if raw_score is not None
+                        else _to_numeric(target_match_val)
+                    )
 
                 if st.session_state.get("account_type") != "business":
                     save_cv_generation(
@@ -3070,17 +3120,6 @@ def analyze_ats_compatibility():
         jd = st.session_state.get('job_description', '') or st.session_state.get('manual_jd', '')
         metadata = st.session_state.get("cv_optimization_metadata") or {}
 
-        def _to_numeric(val):
-            if val is None:
-                return 0
-            if isinstance(val, (int, float)):
-                return int(val)
-            s = str(val).strip().rstrip('%')
-            try:
-                return int(float(s))
-            except (ValueError, TypeError):
-                return 0
-
         if metadata:
             analysis = {
                 "score": metadata.get("ats_score"),
@@ -3110,11 +3149,11 @@ def analyze_ats_compatibility():
 
         with col2:
             st.metric("Measured ATS Score", f"{score_val}%")
-            st.progress(min(1.0, max(0.0, float(score_val) / 100.0)))
+            st.progress(min(1.0, max(0.0, score_val / 100.0)))
 
         with col3:
             st.metric("Keyword Match", f"{kw_val}%")
-            st.progress(min(1.0, max(0.0, float(kw_val) / 100.0)))
+            st.progress(min(1.0, max(0.0, kw_val / 100.0)))
 
         if metadata.get("repair_passes_used") is not None:
             st.caption(f"Optimization repair passes used: {metadata.get('repair_passes_used', 0)}")

@@ -1144,11 +1144,14 @@ def analyze_cv_ats_score(cv_content, job_description=""):
         except Exception as parse_err:
             raise Exception(f"Invalid JSON response: {raw_text}")
 
+        # Coerce LLM-returned values defensively: the prompt asks for numbers but
+        # Gemini/OpenAI sometimes returns them as strings like "67" or "67%".
+        # Without coercion, downstream `float(value)` calls crash on strings.
         result = {
-            "score": parsed.get("ats_score", 0),
-            "keyword_match": parsed.get("keyword_match", 0),
-            "missing_keywords": parsed.get("missing_keywords", []),
-            "suggestions": parsed.get("suggestions", [])
+            "score": _to_int_or_none(parsed.get("ats_score")) or 0,
+            "keyword_match": _to_int_or_none(parsed.get("keyword_match")) or 0,
+            "missing_keywords": parsed.get("missing_keywords", []) or [],
+            "suggestions": parsed.get("suggestions", []) or []
         }
         
         # Cache result

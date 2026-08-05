@@ -83,22 +83,33 @@ def is_experience_mismatched(user_years: Optional[int], query_title: str, job_ti
 
 
 def is_employment_type_mismatched(wanted_work_types: list[str], job_remote_type: str, job_type: str) -> bool:
-    """Phase 6: Reject job type mismatch (e.g. if user requested Internship, don't return full-time jobs)."""
+    """Phase 6: Reject job type mismatch."""
     if not wanted_work_types:
         return False
 
     wanted_low = [w.lower() for w in wanted_work_types]
     job_type_low = (job_type or "").lower()
 
+    # Intern filter: if user wants Internship only, reject full-time non-intern jobs
     if any("intern" in w for w in wanted_low):
-        if "full" in job_type_low and "intern" not in job_type_low:
+        if len(wanted_low) == 1 and "full" in job_type_low and "intern" not in job_type_low:
+            return True
+
+    # Contract filter: if user wants Contract only, reject full-time non-contract jobs
+    if any("contract" in w for w in wanted_low):
+        if len(wanted_low) == 1 and "full" in job_type_low and "contract" not in job_type_low:
             return True
 
     return False
 
 
 def is_location_mismatched(job_location: str, query_location: str = "", query_country: str = "", job_remote_type: str = "") -> bool:
-    """Phase 7: Reject jobs located in a different country/region than requested (unless Worldwide Remote)."""
+    """Phase 7: Reject jobs located in a different country/region than requested.
+
+    Remote jobs (Worldwide, In-country, Unknown) always bypass the country filter
+    because remote work by definition can be done from any location. Country filter
+    only applies to Onsite/Hybrid jobs that require physical presence in the selected country.
+    """
     if not query_country and not query_location:
         return False
 
@@ -106,11 +117,14 @@ def is_location_mismatched(job_location: str, query_location: str = "", query_co
     if q_country == "all":
         return False
 
-    # Worldwide-remote jobs match ANY requested location — never drop them here.
-    if "worldwide" in (job_remote_type or "").lower():
+    loc_low = (job_location or "").lower().strip()
+
+    # Remote jobs (any classification) are location-independent or remote-eligible
+    # Never drop a remote job based on country filter.
+    j_rt = (job_remote_type or "").lower()
+    if "remote" in j_rt or "worldwide" in j_rt or "contract" in j_rt:
         return False
 
-    loc_low = (job_location or "").lower().strip()
     if not loc_low or loc_low == "—":
         return False
 
@@ -133,6 +147,36 @@ def is_location_mismatched(job_location: str, query_location: str = "", query_co
         "es": ["es", "spain", "madrid", "barcelona"],
         "it": ["it", "italy", "rome", "milan"],
         "pl": ["pl", "poland", "warsaw"],
+        "ie": ["ie", "ireland", "dublin", "cork"],
+        "at": ["at", "austria", "vienna", "wien"],
+        "be": ["be", "belgium", "brussels", "antwerp"],
+        "ch": ["ch", "switzerland", "zurich", "geneva", "bern"],
+        "pt": ["pt", "portugal", "lisbon", "porto"],
+        "se": ["se", "sweden", "stockholm", "gothenburg"],
+        "no": ["no", "norway", "oslo", "bergen"],
+        "dk": ["dk", "denmark", "copenhagen"],
+        "fi": ["fi", "finland", "helsinki"],
+        "jp": ["jp", "japan", "tokyo", "osaka"],
+        "hk": ["hk", "hong kong"],
+        "ae": ["ae", "uae", "united arab emirates", "dubai", "abu dhabi"],
+        "ph": ["ph", "philippines", "manila"],
+        "my": ["my", "malaysia", "kuala lumpur"],
+        "id": ["id", "indonesia", "jakarta"],
+        "ar": ["ar", "argentina", "buenos aires"],
+        "cl": ["cl", "chile", "santiago"],
+        "co": ["co", "colombia", "bogota"],
+        "pe": ["pe", "peru", "lima"],
+        "cz": ["cz", "czech republic", "prague", "praha"],
+        "ro": ["ro", "romania", "bucharest"],
+        "hu": ["hu", "hungary", "budapest"],
+        "gr": ["gr", "greece", "athens"],
+        "il": ["il", "israel", "tel aviv"],
+        "kr": ["kr", "south korea", "seoul"],
+        "tw": ["tw", "taiwan", "taipei"],
+        "th": ["th", "thailand", "bangkok"],
+        "vn": ["vn", "vietnam", "ho chi minh", "hanoi"],
+        "tr": ["tr", "turkey", "istanbul", "ankara"],
+        "nl": ["nl", "netherlands", "amsterdam", "rotterdam", "utrecht"],
     }
 
     target_terms = set()

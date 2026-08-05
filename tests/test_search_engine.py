@@ -65,6 +65,53 @@ class TestTitleGuardrail(unittest.TestCase):
         self.assertFalse(is_title_relevant("Python Developer", "Marketing Manager"))
         self.assertFalse(is_title_relevant("Data Analyst", "Customer Support Representative"))
 
+    # --- Core-token & synonym regression tests (Issue #3 fix) ---
+
+    def test_core_token_rejects_generic_role_only_match(self):
+        """Instructional Designer should NOT match generic Designer roles."""
+        self.assertFalse(is_title_relevant("Instructional Designer", "UI/UX Designer"))
+        self.assertFalse(is_title_relevant("Instructional Designer", "Graphic Designer"))
+        self.assertFalse(is_title_relevant("Instructional Designer", "UX Designer"))
+
+    def test_core_token_accepts_same_domain_roles(self):
+        """Instructional Designer should match instructional/learning design variants."""
+        self.assertTrue(is_title_relevant("Instructional Designer", "Senior Instructional Designer"))
+        self.assertTrue(is_title_relevant("Instructional Designer", "Instructional Design Specialist"))
+        self.assertTrue(is_title_relevant("Instructional Designer", "Learning Experience Designer"))
+        self.assertTrue(is_title_relevant("Instructional Designer", "Curriculum Designer"))
+
+    def test_core_token_rejects_cross_role_matches(self):
+        """Different roles sharing generic title nouns should not match."""
+        self.assertFalse(is_title_relevant("Python Developer", "Java Developer"))
+        self.assertFalse(is_title_relevant("Product Manager", "Project Manager"))
+        self.assertFalse(is_title_relevant("Marketing Manager", "Sales Manager"))
+        self.assertFalse(is_title_relevant("Frontend Developer", "Backend Developer"))
+        self.assertFalse(is_title_relevant("Full Stack Developer", "Frontend Developer"))
+        self.assertFalse(is_title_relevant("Data Analyst", "Marketing Analyst"))
+
+    def test_synonym_expansion_accepts_related_roles(self):
+        self.assertTrue(is_title_relevant("DevOps Engineer", "Site Reliability Engineer"))
+        self.assertTrue(is_title_relevant("DevOps Engineer", "Cloud Engineer"))
+        self.assertTrue(is_title_relevant("Machine Learning Engineer", "ML Engineer"))
+        self.assertTrue(is_title_relevant("Machine Learning Engineer", "AI Engineer"))
+        self.assertTrue(is_title_relevant("Data Analyst", "Reporting Analyst"))
+        self.assertTrue(is_title_relevant("Data Analyst", "Business Analyst"))
+        self.assertTrue(is_title_relevant("Project Manager", "Scrum Master"))
+        self.assertTrue(is_title_relevant("UI Designer", "Product Designer"))
+        self.assertTrue(is_title_relevant("Backend Developer", "Python Developer"))
+        self.assertTrue(is_title_relevant("Full Stack Developer", "Full-Stack Engineer"))
+
+    def test_hyphenated_variants_match(self):
+        """full-stack/fullstack should be equivalent for matching."""
+        self.assertTrue(is_title_relevant("Full Stack Developer", "Full Stack Developer"))
+        self.assertTrue(is_title_relevant("Full Stack Developer", "Full-Stack Engineer"))
+        self.assertFalse(is_title_relevant("Full Stack Developer", "Frontend Developer"))
+
+    def test_substring_match_accepted(self):
+        """Exact multi-word query inside job title should always pass."""
+        self.assertTrue(is_title_relevant("Python Developer", "Backend Python Developer"))
+        self.assertTrue(is_title_relevant("UI Designer", "Senior UI Designer"))
+
 
 class TestHardFilters(unittest.TestCase):
     def test_negative_keywords(self):

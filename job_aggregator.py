@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # ----------------------------- Tunables ---------------------------------------
 DEFAULT_TIMEOUT = 8            # seconds per source request
-MAX_RESULTS_PER_SOURCE = 50
+MAX_RESULTS_PER_SOURCE = 80
 MAX_VARIANTS_PER_SOURCE = 2    # search variants fan-out per source (recall boost)
 MAX_DESC_CHARS = 8000         # cap description length before scoring (perf)
 USER_AGENT = "CVOLVE-PRO-JobAggregator/1.0 (+https://cvolvepro.com)"
@@ -61,46 +61,49 @@ _REMOTE_FAMILY = {REMOTE_IN_COUNTRY, REMOTE_WORLDWIDE, REMOTE_UNKNOWN}
 _ADZUNA_CURRENCY = {
     "gb": "£", "us": "$", "ca": "C$", "au": "A$", "in": "₹",
     "de": "€", "fr": "€", "nl": "€", "es": "€", "it": "€",
-    "br": "R$", "mx": "Mex$", "pl": "zł", "za": "R", "nz": "NZ$", "sg": "S$"
+    "br": "R$", "mx": "Mex$", "pl": "zł", "za": "R", "nz": "NZ$", "sg": "S$",
+    "ie": "€", "at": "€", "be": "€", "ch": "CHF", "pt": "€", "se": "kr",
+    "no": "kr", "dk": "kr", "fi": "€", "jp": "¥", "hk": "HK$",
+    "ae": "AED", "ph": "₱", "my": "RM", "id": "Rp", "ar": "ARG$",
+    "cl": "CLP$", "co": "COL$", "pe": "S/", "cz": "Kč", "ro": "lei",
+    "hu": "Ft", "gr": "€", "il": "₪", "kr": "₩", "tw": "NT$",
+    "th": "฿", "tr": "TRY",
 }
 
 COUNTRY_FULL_NAMES = {
-    "in": "India",
-    "us": "United States",
-    "gb": "United Kingdom",
-    "ca": "Canada",
-    "au": "Australia",
-    "de": "Germany",
-    "fr": "France",
-    "nl": "Netherlands",
-    "es": "Spain",
-    "it": "Italy",
-    "br": "Brazil",
-    "mx": "Mexico",
-    "pl": "Poland",
-    "za": "South Africa",
-    "sg": "Singapore",
+    "in": "India", "us": "United States", "gb": "United Kingdom",
+    "ca": "Canada", "au": "Australia", "de": "Germany", "fr": "France",
+    "nl": "Netherlands", "es": "Spain", "it": "Italy", "br": "Brazil",
+    "mx": "Mexico", "pl": "Poland", "za": "South Africa", "sg": "Singapore",
     "nz": "New Zealand",
+    "ie": "Ireland", "at": "Austria", "be": "Belgium", "ch": "Switzerland",
+    "pt": "Portugal", "se": "Sweden", "no": "Norway", "dk": "Denmark",
+    "fi": "Finland", "jp": "Japan", "hk": "Hong Kong", "ae": "United Arab Emirates",
+    "ph": "Philippines", "my": "Malaysia", "id": "Indonesia",
+    "ar": "Argentina", "cl": "Chile", "co": "Colombia", "pe": "Peru",
+    "cz": "Czech Republic", "ro": "Romania", "hu": "Hungary",
+    "gr": "Greece", "il": "Israel", "kr": "South Korea", "tw": "Taiwan",
+    "th": "Thailand", "vn": "Vietnam", "tr": "Turkey", "uy": "Uruguay",
 }
 
 SUPPORTED_COUNTRIES = {
     "all": "🌍 All Countries (Global)",
-    "us": "🇺🇸 United States",
-    "gb": "🇬🇧 United Kingdom",
-    "in": "🇮🇳 India",
-    "ca": "🇨🇦 Canada",
-    "au": "🇦🇺 Australia",
-    "de": "🇩🇪 Germany",
-    "fr": "🇫🇷 France",
-    "nl": "🇳🇱 Netherlands",
-    "es": "🇪🇸 Spain",
-    "it": "🇮🇹 Italy",
-    "br": "🇧🇷 Brazil",
-    "mx": "🇲🇽 Mexico",
-    "pl": "🇵🇱 Poland",
-    "za": "🇿🇦 South Africa",
-    "sg": "🇸🇬 Singapore",
+    "us": "🇺🇸 United States", "gb": "🇬🇧 United Kingdom", "in": "🇮🇳 India",
+    "ca": "🇨🇦 Canada", "au": "🇦🇺 Australia", "de": "🇩🇪 Germany",
+    "fr": "🇫🇷 France", "nl": "🇳🇱 Netherlands", "es": "🇪🇸 Spain",
+    "it": "🇮🇹 Italy", "br": "🇧🇷 Brazil", "mx": "🇲🇽 Mexico",
+    "pl": "🇵🇱 Poland", "za": "🇿🇦 South Africa", "sg": "🇸🇬 Singapore",
     "nz": "🇳🇿 New Zealand",
+    "ie": "🇮🇪 Ireland", "at": "🇦🇹 Austria", "be": "🇧🇪 Belgium",
+    "ch": "🇨🇭 Switzerland", "pt": "🇵🇹 Portugal", "se": "🇸🇪 Sweden",
+    "no": "🇳🇴 Norway", "dk": "🇩🇰 Denmark", "fi": "🇫🇮 Finland",
+    "jp": "🇯🇵 Japan", "hk": "🇭🇰 Hong Kong", "ae": "🇦🇪 UAE",
+    "ph": "🇵🇭 Philippines", "my": "🇲🇾 Malaysia", "id": "🇮🇩 Indonesia",
+    "ar": "🇦🇷 Argentina", "cl": "🇨🇱 Chile", "co": "🇨🇴 Colombia",
+    "pe": "🇵🇪 Peru", "cz": "🇨🇿 Czech Republic", "ro": "🇷🇴 Romania",
+    "hu": "🇭🇺 Hungary", "gr": "🇬🇷 Greece", "il": "🇮🇱 Israel",
+    "kr": "🇰🇷 South Korea", "tw": "🇹🇼 Taiwan", "th": "🇹🇭 Thailand",
+    "vn": "🇻🇳 Vietnam", "tr": "🇹🇷 Turkey",
 }
 
 
@@ -404,12 +407,11 @@ class AdzunaAdapter(SourceAdapter):
     def fetch(self, query):
         country = (query.country or "gb").lower()
         # "All Countries" queries the top markets instead of just US+GB.
-        # Kept to 4 countries so free-tier quota (~300 calls/day) is sustainable.
-        target_countries = ["us", "gb", "in", "de"] if country == "all" else [country]
+        target_countries = ["us", "gb", "in", "de", "ca", "au"] if country == "all" else [country]
         per_page = min(50, max(20, query.limit // len(target_countries)))
         # Paginate through 2 pages for a single country; single page when fanning
         # out across many countries.
-        pages = 2 if len(target_countries) == 1 else 1
+        pages = 2 if len(target_countries) <= 3 else 1
         all_results = []
         wants = set(query.work_types or [])
         wants_remote = bool(wants & _REMOTE_FAMILY) and ONSITE_HYBRID not in wants
@@ -511,7 +513,11 @@ class JSearchAdapter(SourceAdapter):
         num_pages = max(2, min(5, (query.limit + 9) // 10))
         params = {"query": q_text, "page": "1", "num_pages": str(num_pages)}
         if query.country and query.country.lower() != "all":
-            params["country"] = query.country.lower()
+            wants = set(query.work_types or [])
+            # When only worldwide remote is selected, don't lock by country
+            if not (REMOTE_WORLDWIDE in wants and REMOTE_IN_COUNTRY not in wants
+                    and ONSITE_HYBRID not in wants):
+                params["country"] = query.country.lower()
         wants = set(query.work_types or [])
         if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
             params["remote_jobs_only"] = "true"
@@ -597,7 +603,12 @@ class JoobleAdapter(SourceAdapter):
     def fetch(self, query):
         url = f"{self.BASE}/{self.api_key}"
         c_name = COUNTRY_FULL_NAMES.get((query.country or "").lower(), query.country or "")
-        loc = query.location or (c_name if query.country and query.country.lower() != "all" else "")
+        wants = set(query.work_types or [])
+        # When only worldwide remote is selected, don't force a country in location
+        if REMOTE_WORLDWIDE in wants and REMOTE_IN_COUNTRY not in wants and ONSITE_HYBRID not in wants:
+            loc = query.location or ""
+        else:
+            loc = query.location or (c_name if query.country and query.country.lower() != "all" else "")
         payload = {"keywords": query.title, "location": loc}
         data = self._request(url, method="POST", json_body=payload)
         return (data.get("jobs") or [])[: query.limit]
@@ -872,7 +883,44 @@ def _matches_work_type(job: Job, wanted: set[str]) -> bool:
     # "Remote — check eligibility" satisfies any remote request (honest inclusion)
     if job.remote_type == REMOTE_UNKNOWN and (wanted & _REMOTE_FAMILY):
         return True
+    # "Remote (in-country)" satisfies "Remote (worldwide)" — when a user
+    # wants worldwide remote they expect ALL remote jobs, not exclusively borderless ones.
+    if REMOTE_WORLDWIDE in wanted and job.remote_type == REMOTE_IN_COUNTRY:
+        return True
+    # "Contract/Project" is a valid hit when any remote family is selected
+    # (contract roles are often remote)
+    if CONTRACT in wanted and job.remote_type == REMOTE_UNKNOWN:
+        return True
     return False
+
+
+def _classify_remote_from_text(title: str, description: str, location: str) -> str:
+    """Guess remote type from job text when source doesn't provide a clear signal.
+
+    Only reclassifies when the title or description strongly indicates remote work
+    (not just the location field, which sometimes defaults to 'Remote').
+    """
+    combined = f"{title} {description[:600]}".lower()
+    loc_low = (location or "").lower()
+    has_remote = "remote" in combined
+    has_remote_loc = "remote" in loc_low
+
+    # Strong worldwide signals in title/description
+    is_worldwide = has_remote and any(k in combined for k in (
+        "worldwide", "anywhere", "global", "multiple countries",
+        "work from anywhere", "no location", "fully remote", "100% remote",
+        "entirely remote", "completely remote"
+    ))
+    has_hybrid = "hybrid" in combined
+    has_onsite = "on" in combined and ("site" in combined or "premises" in combined)
+
+    if is_worldwide:
+        return REMOTE_WORLDWIDE
+    if has_remote and not has_hybrid and not has_onsite:
+        return REMOTE_UNKNOWN  # title/desc mentions remote, not hybrid/onsite
+    if has_remote_loc and not has_remote and not has_hybrid and not has_onsite:
+        return REMOTE_IN_COUNTRY  # location says remote, title/desc silent
+    return ""
 
 
 def _title_variants(query: SearchQuery) -> list[str]:
@@ -989,7 +1037,17 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
 
     deduped = deduplicate_jobs(_dedupe(collected))
 
-    # Phase 3-9: Hard Filters (Age Cutoff < 45d, Negative Keywords, Title Guardrail < 40%, Experience Mismatch, Job Type Mismatch, Domain Mismatch)
+    # Post-classify remote types for jobs where source didn't detect remote keywords.
+    # Only touch jobs from sources known to under-report remote, and only when
+    # the current classification is ONSITE_HYBRID (meaning no remote signal detected).
+    _SOURCES_NEEDING_REMOTE_CHECK = {"adzuna", "jooble", "themuse", "arbeitnow"}
+    for job in deduped:
+        if job.remote_type == ONSITE_HYBRID and job.source in _SOURCES_NEEDING_REMOTE_CHECK:
+            guessed = _classify_remote_from_text(job.title, job.description, job.location)
+            if guessed:
+                job.remote_type = guessed
+
+    # Phase 3-9: Hard Filters (Age Cutoff, Negative Keywords, Title Guardrail, Experience Mismatch, Job Type Mismatch, Domain Mismatch)
     surviving_jobs: list[Job] = []
     for job in deduped:
         if is_job_expired(job.posted_date):

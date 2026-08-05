@@ -85,17 +85,36 @@ class TestLocationFilterRemoteAwareness(unittest.TestCase):
                                    job_remote_type=REMOTE_WORLDWIDE)
         )
 
-    def test_in_country_remote_filtered_by_country(self):
+    def test_in_country_remote_passes_any_country(self):
         from search_engine.filters import is_location_mismatched
-        # US remote job requested under India filter → mismatched
-        self.assertTrue(
+        # Redesigned: ALL remote jobs bypass country filter. Work-type
+        # filtering separates REMOTE_IN_COUNTRY vs REMOTE_WORLDWIDE.
+        self.assertFalse(
             is_location_mismatched("Austin, US", query_country="in",
                                    job_remote_type=REMOTE_IN_COUNTRY)
         )
-        # US remote job requested under US filter → OK
         self.assertFalse(
             is_location_mismatched("Austin, US", query_country="us",
                                    job_remote_type=REMOTE_IN_COUNTRY)
+        )
+
+    def test_onsite_jobs_filtered_by_country(self):
+        from search_engine.filters import is_location_mismatched
+        # Onsite/Hybrid jobs MUST match the selected country
+        self.assertTrue(
+            is_location_mismatched("Austin, US", query_country="in",
+                                   job_remote_type=ONSITE_HYBRID)
+        )
+        self.assertFalse(
+            is_location_mismatched("Austin, US", query_country="us",
+                                   job_remote_type=ONSITE_HYBRID)
+        )
+
+    def test_contract_jobs_bypass_country(self):
+        from search_engine.filters import is_location_mismatched
+        self.assertFalse(
+            is_location_mismatched("Austin, US", query_country="in",
+                                   job_remote_type=CONTRACT)
         )
 
 
@@ -119,6 +138,51 @@ class TestRemoteInLocationBox(unittest.TestCase):
         ja.search_jobs(q, sources=[FakeAdapter()])
         self.assertEqual(captured["location"], "")
         self.assertIn(REMOTE_WORLDWIDE, captured["work_types"])
+
+
+class TestWorkTypeMatch(unittest.TestCase):
+    """Regression tests for _matches_work_type & remote work type filtering."""
+
+    def test_worldwide_matches_worldwide(self):
+        self.assertTrue(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="—", remote_type=REMOTE_WORLDWIDE,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_WORLDWIDE}))
+
+    def test_worldwide_matches_in_country(self):
+        # Worldwide filter should also show in-country remote jobs
+        self.assertTrue(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="US", remote_type=REMOTE_IN_COUNTRY,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_WORLDWIDE}))
+
+    def test_worldwide_does_not_match_onsite(self):
+        self.assertFalse(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="US", remote_type=ONSITE_HYBRID,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_WORLDWIDE}))
+
+    def test_in_country_does_not_match_onsite(self):
+        self.assertFalse(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="US", remote_type=ONSITE_HYBRID,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_IN_COUNTRY}))
+
+    def test_unknown_remote_satisfies_any(self):
+        self.assertTrue(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="", remote_type=REMOTE_UNKNOWN,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_WORLDWIDE}))
+        self.assertTrue(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="", remote_type=REMOTE_UNKNOWN,
+                   job_type="", url="x", source="x", source_name="x"),
+            {REMOTE_IN_COUNTRY}))
+
+    def test_onsite_hybrid_matches_onsite_only(self):
+        self.assertTrue(ja._matches_work_type(
+            ja.Job(title="T", company="C", location="US", remote_type=ONSITE_HYBRID,
+                   job_type="", url="x", source="x", source_name="x"),
+            {ONSITE_HYBRID}))
 
 
 class TestTitleVariants(unittest.TestCase):

@@ -181,23 +181,29 @@ def get_gemini_response(prompt: str, model: str = "gemini-2.5-flash") -> str:
 def filter_keywords(keywords):
     """Remove generic and stop words from keyword list.
     
-    Kept words (removed from stop list) are real ATS keywords that ATS systems
-    search for: 'team', 'communication', 'strong', 'demonstrated', 'proven',
-    'track', 'record', 'preferred'.
+    Excludes non-discriminative filler terms and common workplace vocabulary
+    (e.g., 'team', 'management', 'communication', 'experience', 'skills') to prevent
+    inflated overlap scores across unrelated job categories.
     """
     stop_words = {
         "the", "and", "is", "in", "of", "for", "to", "with", "on", "at", "by", "an", "be",
         "from", "that", "this", "it", "as", "are", "or", "have", "has", "was", "were", "will",
         "a", "i", "you", "your", "we", "our", "can", "able", "aptitude",
-        "dynamic", "motivated", "great", "capable",
-        "good", "proficient", "hardworking", "dedicated", "excellent",
+        "dynamic", "motivated", "great", "capable", "good", "proficient", "hardworking", "dedicated", "excellent",
         "role", "work", "job", "candidate", "company", "business", "support", "help",
         "looking", "requirement", "requirements", "required", "knowledge",
         "qualification", "qualifications", "duties", "environment", "ability", "working",
         "seeking", "description", "location", "full-time", "part-time", "contract", "salary", "apply",
         "please", "send", "cv", "resume", "years", "year", "must", "should", "join", "grow",
-        "etc", "using", "uses", "used",
-        "ideal", "position", "opportunity", "well", "plus",
+        "etc", "using", "uses", "used", "ideal", "position", "opportunity", "well", "plus",
+        # Generic organizational & process words that cause false matches:
+        "team", "management", "experience", "skills", "communication", "process", "develop",
+        "project", "ensure", "provide", "strong", "including", "understanding", "responsible",
+        "quality", "preferred", "time", "make", "new", "also", "best", "high", "key",
+        "demonstrated", "proven", "track", "record", "across", "within", "relevant", "field",
+        "degree", "bachelor", "master", "related", "level", "person", "people", "staff",
+        "member", "members", "day", "daily", "overall", "general", "various", "multiple",
+        "internal", "external", "key", "successful", "focus", "focused", "solutions",
     }
     return [kw for kw in keywords if kw.lower() not in stop_words and len(kw) > 2]
 

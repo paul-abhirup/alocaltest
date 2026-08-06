@@ -6,7 +6,7 @@ Pass 2 LLM Re-ranker.
 from utils import get_gemini_response
 import json
 
-def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list) -> dict:
+def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list, target_role: str = "") -> dict:
     """
     Evaluates top jobs against the resume and query.
     Takes up to 20 jobs, sends a batch prompt to Gemini, and returns a dict mapping job.id to a new score.
@@ -14,11 +14,11 @@ def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list) -> di
     if not jobs:
         return {}
 
-    # Create a truncated payload for the prompt to fit within context and reduce latency.
+    # Create an expanded payload for the prompt to include more technical details
     jobs_payload = []
     for i, job in enumerate(jobs):
         job_id = getattr(job, "id", None) or getattr(job, "url", None) or f"job_{i}"
-        desc_snippet = (getattr(job, "description", "") or "")[:400]
+        desc_snippet = (getattr(job, "description", "") or "")[:800]
         jobs_payload.append({
             "index": i,
             "id": str(job_id),
@@ -27,24 +27,28 @@ def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list) -> di
             "description_snippet": desc_snippet
         })
 
-    prompt = f"""
-    You are an expert technical recruiter and career coach.
-    Evaluate the fit between the candidate's resume/query and the following list of job postings.
-    Score from 0 to 100 based on experience level alignment, key responsibility fit, and tech stack compatibility.
-    Be strict: heavily penalize jobs that require much more experience than the candidate has, or fundamentally different skills.
-    
-    Candidate Query Title: {query_title}
-    Candidate Resume: {resume_text[:2000] if resume_text else "Not provided (base it purely on query title)"}
-    
-    Jobs:
-    {json.dumps(jobs_payload, indent=2)}
-    
-    Respond ONLY in valid JSON format mapping the job 'id' to an integer score:
-    {{
-        "job_id_1": 85,
-        "job_id_2": 42
-    }}
-    """
+    prompt = f"""You are an expert recruiter evaluating candidate-job fit.
+Score each job posting from 0 to 100 based on fit with the candidate's resume and target role.
+
+STRICT DOMAIN ALIGNMENT RULES:
+1. **Irrelevant Domain Mismatch**: If the job is in a COMPLETELY DIFFERENT career field than the candidate's background/target role (e.g., Software Engineer CV applying for Marketing, HR, Finance, Sales, or Hospitality jobs), you MUST score it between 0 and 15. DO NOT evaluate keywords for domain-mismatched roles.
+2. **Adjacent Field**: Score 20 to 45 for adjacent fields with minor transferable skills.
+3. **Same Field / Related Specialization**: Score 50 to 75.
+4. **Strong Direct Match**: Score 75 to 100.
+
+Candidate Target Role: {target_role or query_title}
+Candidate Resume Summary:
+{resume_text[:2500] if resume_text else "Not provided (base strictly on query title: " + query_title + ")"}
+
+Job Postings to Evaluate:
+{json.dumps(jobs_payload, indent=2)}
+
+Respond ONLY in valid JSON mapping job 'id' string to an integer score (0-100):
+{{
+    "job_id_1": 85,
+    "job_id_2": 10
+}}
+"""
 
     try:
         response_text = get_gemini_response(prompt, model="gemini-2.5-flash")
@@ -58,8 +62,9 @@ def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list) -> di
         if clean_text.endswith("```"):
             clean_text = clean_text[:-3]
             
-        scores = json.dumps(clean_text)
-        return json.loads(clean_text)
+        parsed = json.loads(clean_text.strip())
+        return parsed if isinstance(parsed, dict) else {}
     except Exception as e:
         print(f"Error in LLM re-ranking: {e}")
         return {}
+

@@ -1300,7 +1300,7 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
                 )
                 with st.spinner("Searching live job sources…"):
                     try:
-                        result = ja.search_jobs(query, resume_text=resume_text or None)
+                        result = ja.search_jobs(query, resume_text=resume_text or None, target_role=title.strip())
                     except Exception as e:
                         result = None
                         st.error(f"❌ Job search failed: {e}")

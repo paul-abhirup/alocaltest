@@ -989,7 +989,8 @@ def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: flo
 
 
 def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
-                sources: Optional[list[SourceAdapter]] = None) -> dict:
+                sources: Optional[list[SourceAdapter]] = None,
+                target_role: Optional[str] = None) -> dict:
     """Fan out to enabled sources (in parallel, with search variants), dedupe,
     score (per-user), filter, sort.
 
@@ -1076,7 +1077,8 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         score_int, title_sim, matched_skills = calculate_composite_score(
             query_title=query.title,
             job=job,
-            resume_text=resume_text
+            resume_text=resume_text,
+            target_role=target_role
         )
         job.match_score = score_int
         job.relevance_score = score_int
@@ -1114,7 +1116,7 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
     from search_engine.ranking.llm_reranker import evaluate_job_fit_batch
     top_candidates = filtered[:20]
     if top_candidates and resume_text and resume_text.strip():
-        llm_scores = evaluate_job_fit_batch(resume_text, query.title, top_candidates)
+        llm_scores = evaluate_job_fit_batch(resume_text, query.title, top_candidates, target_role=target_role or "")
         for i, job in enumerate(top_candidates):
             job_id = str(getattr(job, "id", None) or getattr(job, "url", None) or f"job_{i}")
             if job_id in llm_scores:

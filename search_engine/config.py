@@ -110,14 +110,73 @@ STEM_RULES = [
 
 # Composite scoring weights (must sum to 1.0)
 DEFAULT_WEIGHTS = {
-    "title_match": 0.30,
-    "query_skill_match": 0.28,
-    "resume_match": 0.15,
-    "freshness": 0.14,
-    "company_quality": 0.05,
-    "salary_match": 0.05,
+    "title_match": 0.28,
+    "query_skill_match": 0.27,
+    "resume_match": 0.25,
+    "freshness": 0.10,
+    "company_quality": 0.04,
+    "salary_match": 0.03,
     "description_quality": 0.03,
 }
+
+# Career Domain Mapping for Domain Alignment Gating
+CAREER_DOMAINS = {
+    "software_engineering": [
+        "developer", "engineer", "software", "frontend", "backend", "fullstack", "full-stack", "full stack",
+        "web developer", "mobile developer", "ios", "android", "devops", "sre", "cloud engineer",
+        "system architect", "solution architect", "qa engineer", "test engineer", "automation engineer",
+        "react", "node", "python", "java", "c++", "golang", "ruby", "php", "typescript"
+    ],
+    "data_ai": [
+        "data analyst", "data scientist", "data engineer", "machine learning", "ml engineer",
+        "ai engineer", "deep learning", "nlp", "computer vision", "analytics engineer", "bi analyst",
+        "business intelligence", "big data", "statist", "quantitative analyst"
+    ],
+    "design_ux": [
+        "ux designer", "ui designer", "product designer", "user experience", "user interface",
+        "graphic designer", "visual designer", "interaction designer", "creative director",
+        "animator", "instructional designer", "learning designer"
+    ],
+    "marketing_growth": [
+        "marketing", "digital marketing", "seo", "sem", "content manager", "growth marketer",
+        "social media", "brand manager", "copywriter", "marketing specialist", "email marketing"
+    ],
+    "sales_bizdev": [
+        "sales", "account executive", "account manager", "business development", "bdr", "sdr",
+        "sales director", "client partner", "relationship manager"
+    ],
+    "hr_recruiting": [
+        "recruiter", "talent acquisition", "human resources", "hr manager", "people ops",
+        "hr business partner", "headhunter", "talent manager"
+    ],
+    "finance_accounting": [
+        "accountant", "financial analyst", "auditor", "controller", "bookkeeper",
+        "tax specialist", "payroll", "finance manager"
+    ],
+    "product_management": [
+        "product manager", "product owner", "product lead", "chief product officer",
+        "head of product", "technical product manager"
+    ],
+    "project_operations": [
+        "project manager", "program manager", "scrum master", "agile coach", "operations manager",
+        "pmo", "supply chain", "logistics coordinator"
+    ],
+}
+
+def detect_career_domain(text: str) -> str:
+    """Classify text (resume or job title/description) into a career domain based on keyword matching."""
+    if not text:
+        return "unknown"
+    t_lower = text.lower()
+    scores = {}
+    for domain, keywords in CAREER_DOMAINS.items():
+        score = sum(1 for kw in keywords if kw in t_lower)
+        if score > 0:
+            scores[domain] = score
+    if not scores:
+        return "unknown"
+    return max(scores, key=scores.get)
+
 
 # Negative keywords: Automatically reject titles containing these words unless user explicitly searched for them.
 # Kept focused on education/recruiting roles that don't fit the platform's job-match intent.

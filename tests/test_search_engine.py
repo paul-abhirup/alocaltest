@@ -262,5 +262,48 @@ class TestPhantomSkillMatchFix(unittest.TestCase):
         self.assertEqual(matched, [])
 
 
+class TestIrrelevantRoleATSScoreFix(unittest.TestCase):
+    def test_irrelevant_job_role_score_is_penalized(self):
+        dev_resume = "Senior Python Developer with 5 years experience in Django, FastAPI, Docker, PostgreSQL, AWS, CI/CD."
+        marketing_job = DummyJob(
+            title="Marketing Manager",
+            company="BrandCorp",
+            location="Remote",
+            description="We are looking for a Marketing Manager to lead growth marketing, SEO, SEM, social media campaigns, and brand management."
+        )
+        score, title_sim, matched = calculate_composite_score(
+            query_title="Python Developer",
+            job=marketing_job,
+            resume_text=dev_resume,
+            target_role="Python Developer"
+        )
+        self.assertLessEqual(score, 25, f"Expected score for irrelevant job role to be <= 25, got {score}")
+
+    def test_relevant_job_role_score_is_high(self):
+        dev_resume = "Senior Python Developer with 5 years experience in Django, FastAPI, Docker, PostgreSQL, AWS, CI/CD."
+        dev_job = DummyJob(
+            title="Python Engineer",
+            company="TechCorp",
+            location="Remote",
+            description="Looking for a Python Engineer skilled in Django, FastAPI, Docker, PostgreSQL, AWS, REST APIs."
+        )
+        score, title_sim, matched = calculate_composite_score(
+            query_title="Python Developer",
+            job=dev_job,
+            resume_text=dev_resume,
+            target_role="Python Developer"
+        )
+        self.assertGreaterEqual(score, 65, f"Expected score for relevant job role to be >= 65, got {score}")
+
+    def test_noise_words_filtered_from_keyword_overlap(self):
+        from utils import keyword_overlap_score
+        # A generic description containing mostly noise words should not yield high overlap score
+        generic_jd = "Great team working environment. We require experience and communication skills to support company projects."
+        resume = "Python developer with technical skills in software engineering."
+        score = keyword_overlap_score(resume, generic_jd)
+        self.assertLessEqual(score, 30, f"Expected low overlap score for generic noise words, got {score}")
+
+
 if __name__ == "__main__":
     unittest.main()
+

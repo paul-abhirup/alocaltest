@@ -137,12 +137,15 @@ def parse_gap_analysis(raw_text, max_gaps: int = 5) -> dict:
         if not question:                             # a gap with no question is useless
             continue
         area = str(g.get("area") or "").strip() or question
+        example_text = str(g.get("example") or "").strip()
+        if len(example_text) < 15:
+            example_text = ""  # Too short to be useful; leave text area empty
         gaps.append({
             "id": str(g.get("id") or f"gap_{i + 1}").strip(),
             "area": area,
             "why": str(g.get("why") or "").strip(),
             "question": question,
-            "example": str(g.get("example") or "").strip(),
+            "example": example_text,
         })
     gaps = gaps[:max_gaps]
 
@@ -169,8 +172,18 @@ def analyze_cv_jd_gaps(resume_text, job_description, language: str = "English", 
     prompt = f"""
     You are a career coach comparing a candidate's résumé against a target job description.
     Identify AT MOST {max_gaps} areas the JD clearly requires but the résumé shows no or weak
-    evidence for. For each, write ONE clear question the candidate can answer to supply real
-    evidence, plus one short concrete EXAMPLE answer so they understand what's expected.
+    evidence for. For each gap, write:
+    1. ONE clear question the candidate can answer to supply real evidence.
+    2. A strong, PERSONALISED example answer written AS IF the candidate is replying,
+       using specific details extracted from THEIR résumé (real project names, company names,
+       tech stack, metrics, dates). The example answer MUST be:
+       - Written in first person ("I led…", "At [Company], I…")
+       - 2-4 sentences long
+       - Directly reference real experience from the résumé that is closest to the gap
+       - Ready to copy-paste with only minor edits needed by the candidate
+       - If the résumé has NO related experience at all for a gap, write
+         "No direct experience found in your CV — please describe any related experience you have."
+         instead of fabricating details.
 
     Return STRICT JSON ONLY (no prose, no code fences) in exactly this shape:
     {{
@@ -178,7 +191,8 @@ def analyze_cv_jd_gaps(resume_text, job_description, language: str = "English", 
       "overall_match": <integer 0-100 estimate>,
       "gaps": [
         {{"id": "<short_slug>", "area": "<missing area>", "why": "<why it is a gap>",
-          "question": "<one clear question>", "example": "<one concrete example answer>"}}
+          "question": "<one clear question>",
+          "example": "<a personalised, first-person draft answer grounded in the candidate's CV>"}}
       ]
     }}
     If the résumé already covers the JD well, return "sufficient": true and an empty "gaps" list.

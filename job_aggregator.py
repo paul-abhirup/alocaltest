@@ -1105,6 +1105,27 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         reverse=True,
     )
 
+    # Phase 2 Re-ranking: LLM Top-K Re-ranker
+    # Take top 20 candidate jobs and run a batch LLM prompt
+    from search_engine.ranking.llm_reranker import evaluate_job_fit_batch
+    top_candidates = filtered[:20]
+    if top_candidates:
+        llm_scores = evaluate_job_fit_batch(resume_text or "", query.title, top_candidates)
+        for job in top_candidates:
+            if str(job.id) in llm_scores:
+                # Combine hybrid match score and LLM re-rank score
+                llm_score = llm_scores[str(job.id)]
+                if isinstance(llm_score, (int, float)):
+                    # Let LLM score have a 50% weight on the final match score for the top 20
+                    current = job.match_score if job.match_score is not None else 50
+                    job.match_score = int(round((current * 0.5) + (llm_score * 0.5)))
+                    
+        # Re-sort after LLM re-ranking
+        filtered.sort(
+            key=lambda j: (j.match_score if j.match_score is not None else -1, j.posted_date),
+            reverse=True,
+        )
+
     # Distinguish the three empty states so the UI can guide the user.
     empty_reason = None
     if not adapters:

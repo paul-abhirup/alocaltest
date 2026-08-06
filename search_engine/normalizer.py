@@ -40,32 +40,72 @@ def normalize_title(raw_title: str) -> str:
 
 
 def generate_search_variants(query_title: str) -> list[str]:
-    """Generate search title variants/aliases to improve recall across external APIs."""
+    """Generate search title variants/aliases to improve recall across external APIs using Gemini."""
     if not query_title or not query_title.strip():
         return []
 
-    norm = normalize_title(query_title)
-    variants = [query_title.strip(), norm]
-    
-    low = norm.lower()
-    
-    # Dev / Engineer variations
-    if "developer" in low:
-        variants.append(re.sub(r"\bdeveloper\b", "Engineer", norm, flags=re.IGNORECASE))
-        variants.append(re.sub(r"\bdeveloper\b", "Software Engineer", norm, flags=re.IGNORECASE))
-    elif "engineer" in low:
-        variants.append(re.sub(r"\bengineer\b", "Developer", norm, flags=re.IGNORECASE))
-        variants.append(re.sub(r"\bsoftware engineer\b", "Developer", norm, flags=re.IGNORECASE))
+    try:
+        from utils import get_gemini_response
+        import json
 
-    # Tech-specific role aliases
-    if "python" in low:
-        variants.extend(["Python Developer", "Python Engineer", "Backend Python Engineer", "Software Engineer Python"])
-    elif "react" in low:
-        variants.extend(["React Developer", "React Engineer", "Frontend React Developer"])
-    elif "node" in low:
-        variants.extend(["Node.js Developer", "Node Developer", "Backend Node Engineer"])
-    elif "java" in low and "javascript" not in low:
-        variants.extend(["Java Developer", "Java Software Engineer", "Backend Java Engineer"])
+        prompt = f"""
+        You are an expert technical recruiter. Analyze the following job search query and generate:
+        1. A normalized primary title.
+        2. Up to 3 alternative job titles or search variants.
+        
+        Query: "{query_title}"
+        
+        Respond ONLY in valid JSON format exactly like this:
+        {{
+            "primary_title": "...",
+            "variants": ["...", "...", "..."]
+        }}
+        """
+        
+        response_text = get_gemini_response(prompt, model="gemini-2.5-flash")
+        
+        # Clean markdown code block if present
+        clean_text = response_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        if clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+            
+        data = json.loads(clean_text.strip())
+        
+        variants = [query_title.strip()]
+        if "primary_title" in data and data["primary_title"]:
+            variants.append(data["primary_title"])
+        if "variants" in data and isinstance(data["variants"], list):
+            variants.extend(data["variants"])
+            
+    except Exception as e:
+        print(f"Error calling Gemini for query expansion: {e}")
+        # Fallback to the old logic
+        norm = normalize_title(query_title)
+        variants = [query_title.strip(), norm]
+        
+        low = norm.lower()
+        
+        # Dev / Engineer variations
+        if "developer" in low:
+            variants.append(re.sub(r"\bdeveloper\b", "Engineer", norm, flags=re.IGNORECASE))
+            variants.append(re.sub(r"\bdeveloper\b", "Software Engineer", norm, flags=re.IGNORECASE))
+        elif "engineer" in low:
+            variants.append(re.sub(r"\bengineer\b", "Developer", norm, flags=re.IGNORECASE))
+            variants.append(re.sub(r"\bsoftware engineer\b", "Developer", norm, flags=re.IGNORECASE))
+    
+        # Tech-specific role aliases
+        if "python" in low:
+            variants.extend(["Python Developer", "Python Engineer", "Backend Python Engineer", "Software Engineer Python"])
+        elif "react" in low:
+            variants.extend(["React Developer", "React Engineer", "Frontend React Developer"])
+        elif "node" in low:
+            variants.extend(["Node.js Developer", "Node Developer", "Backend Node Engineer"])
+        elif "java" in low and "javascript" not in low:
+            variants.extend(["Java Developer", "Java Software Engineer", "Backend Java Engineer"])
 
     # Deduplicate preserving order
     seen = set()

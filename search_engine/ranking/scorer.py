@@ -32,8 +32,17 @@ def calculate_composite_score(
     # 2. Skill Match (28%)
     skill_score, matched_skills = score_skills(f"{query_title} {job.title}", job.description)
 
-    # 3. Resume Match (15%)
+    # 3. Resume Match (15%) - Hybrid of Keyword Overlap and Semantic Similarity
     res_score = score_resume(resume_text, job.description)
+    if resume_text:
+        from search_engine.ranking.semantic_score import SemanticScorer
+        semantic_scorer = SemanticScorer()
+        # Pass resume text as query_title and job
+        semantic_sim = semantic_scorer.score(resume_text, job)
+        # Hybrid: 40% Keyword, 60% Vector Similarity
+        hybrid_resume_score = (res_score * 0.4) + (semantic_sim * 0.6)
+    else:
+        hybrid_resume_score = res_score
 
     # 4. Freshness Decay (14%)
     fresh_score = score_freshness(getattr(job, "posted_date", ""))
@@ -52,7 +61,7 @@ def calculate_composite_score(
     total_score = (
         weights["title_match"] * title_sim +
         weights["query_skill_match"] * skill_score +
-        weights["resume_match"] * res_score +
+        weights["resume_match"] * hybrid_resume_score +
         weights["freshness"] * fresh_score +
         weights["company_quality"] * comp_score +
         weights["salary_match"] * salary_score +

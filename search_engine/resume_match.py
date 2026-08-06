@@ -134,3 +134,58 @@ def is_resume_job_mismatched(
     min_required = max(1, int(len(resume_terms) * 0.03))
 
     return len(overlap) < min_required
+
+def generate_gap_analysis(resume_text: str, job_description: str) -> dict:
+    """
+    Pillar 4: AI Resume-to-Job Deep Match & Gap Analysis.
+    Evaluates the candidate's resume against the job description to output structured JSON:
+    - match_score_percentage
+    - key_strengths
+    - missing_skills_gaps
+    - application_tip
+    """
+    if not resume_text or not job_description:
+        return {
+            "match_score_percentage": 50,
+            "key_strengths": [],
+            "missing_skills_gaps": [],
+            "application_tip": "Provide a resume and job description to get a detailed gap analysis."
+        }
+        
+    try:
+        from utils import get_gemini_response
+        import json
+        
+        prompt = f"""
+        Act as a career coach. Compare this resume to the job description.
+        Provide JSON output with:
+        - match_score_percentage (integer)
+        - key_strengths (list of up to 3 short strings)
+        - missing_skills_gaps (list of up to 3 short strings)
+        - application_tip (1 short sentence)
+        
+        Resume: {resume_text[:2000]}
+        Job Description: {job_description[:2000]}
+        
+        Respond ONLY with the JSON object.
+        """
+        
+        response_text = get_gemini_response(prompt, model="gemini-2.5-flash")
+        
+        clean_text = response_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        if clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+            
+        return json.loads(clean_text.strip())
+    except Exception as e:
+        print(f"Error generating gap analysis: {e}")
+        return {
+            "match_score_percentage": 50,
+            "key_strengths": ["Analysis temporarily unavailable"],
+            "missing_skills_gaps": ["Analysis temporarily unavailable"],
+            "application_tip": "Please try again later."
+        }

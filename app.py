@@ -858,6 +858,25 @@ def _render_job_results_unified(result, resume_text):
                 with st.expander("💡 Why this job?"):
                     for bullet in j_why_matched:
                         st.markdown(f"- {bullet}")
+                        
+            # AI Resume-to-Job Deep Match & Gap Analysis
+            if resume_text:
+                with st.expander("🤖 AI Match Analysis"):
+                    if st.button("Run AI Deep Match", key=f"ai_match_btn_{i}"):
+                        with st.spinner("Analyzing match..."):
+                            from search_engine.resume_match import generate_gap_analysis
+                            ai_analysis = generate_gap_analysis(resume_text, j_desc)
+                            st.write(f"**Match Score:** {ai_analysis.get('match_score_percentage', 50)}%")
+                            
+                            st.write("**Key Strengths:**")
+                            for strength in ai_analysis.get('key_strengths', []):
+                                st.write(f"- ✅ {strength}")
+                                
+                            st.write("**Missing Skills / Gaps:**")
+                            for gap in ai_analysis.get('missing_skills_gaps', []):
+                                st.write(f"- ❌ {gap}")
+                                
+                            st.info(f"💡 **Tip:** {ai_analysis.get('application_tip', '')}")
 
             col_opt, col_src = st.columns([2, 3])
             with col_opt:
@@ -1492,10 +1511,15 @@ def _show_manual_jd_mode(email: str):
                     st.markdown(f"**{gap.get('area', '')}**")
                     if gap.get("why"):
                         st.caption(f"Why this matters: {gap['why']}")
+                    example = gap.get("example", "")
                     val = st.text_area(
                         gap.get("question", "Tell us more:"),
-                        key=f"gap_manual_{gap.get('id', gap.get('area', ''))}"
+                        value=example,
+                        key=f"gap_manual_{gap.get('id', gap.get('area', ''))}",
+                        height=100,
                     )
+                    if example:
+                        st.caption("💡 *This answer was drafted from your CV — review and edit it to be accurate.*")
                     if val.strip():
                         answers[gap.get("area", "")] = val.strip()
 
@@ -1884,15 +1908,16 @@ def show_smart_job_match_page():
                 st.markdown(f"**{gap.get('area', '')}**")
                 if gap.get("why"):
                     st.caption(f"Why this matters: {gap['why']}")
+                example = gap.get("example", "")
                 st.text_area(
                     gap.get("question", "Tell us more:"),
+                    value=example,
                     key=f"gap_answer_{gap['id']}",
                     placeholder="Type your verified experience here…",
-                    height=80,
+                    height=100,
                 )
-                example = gap.get("example", "")
                 if example:
-                    st.caption(f"💡 Example answer: {example}")
+                    st.caption("💡 *This answer was drafted from your CV — review and edit it to be accurate.*")
 
         st.info(
             "Please provide accurate information based on your real experience. CVOLVE PRO can "

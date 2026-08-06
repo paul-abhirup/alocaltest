@@ -17,13 +17,13 @@ def evaluate_job_fit_batch(resume_text: str, query_title: str, jobs: list) -> di
     # Create a truncated payload for the prompt to fit within context and reduce latency.
     jobs_payload = []
     for i, job in enumerate(jobs):
-        # Using a small snippet of description to save tokens
-        desc_snippet = (job.description or "")[:400]
+        job_id = getattr(job, "id", None) or getattr(job, "url", None) or f"job_{i}"
+        desc_snippet = (getattr(job, "description", "") or "")[:400]
         jobs_payload.append({
             "index": i,
-            "id": job.id,
-            "title": job.title,
-            "company": job.company,
+            "id": str(job_id),
+            "title": getattr(job, "title", ""),
+            "company": getattr(job, "company", ""),
             "description_snippet": desc_snippet
         })
 

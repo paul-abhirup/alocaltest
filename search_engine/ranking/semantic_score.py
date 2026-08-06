@@ -50,16 +50,13 @@ class SemanticScorer:
         # Enrich the query text with candidate skills if provided
         query_text = f"{query_title} {candidate_skills}".strip()
         
-        # Get job text (prefer description, fallback to title)
-        job_text = getattr(job, "description", "")
-        if not job_text:
-            job_text = getattr(job, "title", "")
+        # Embed role title + company snippet for fast, cacheable semantic matching
+        job_role_text = f"{getattr(job, 'title', '')} {getattr(job, 'company', '')}".strip()
+        if not job_role_text:
+            job_role_text = job_text[:300]
             
-        if not job_text:
-            return 50.0
-            
-        q_emb = get_gemini_embedding(query_text)
-        j_emb = get_gemini_embedding(job_text[:2000])  # limit length for embedding
+        q_emb = get_gemini_embedding(query_text[:1000])
+        j_emb = get_gemini_embedding(job_role_text)
         
         if not q_emb or not j_emb:
             return 50.0

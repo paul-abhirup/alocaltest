@@ -1247,35 +1247,35 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input("Job Title *", key="ja_title", placeholder="e.g. Python Developer")
-            location = st.text_input("Location", key="ja_location", placeholder="e.g. London / Remote")
         with c2:
             yoe = st.number_input("Years of Experience", min_value=0, max_value=50, value=0, step=1, key="ja_yoe")
-            supported_countries = getattr(ja, "SUPPORTED_COUNTRIES", {
-                "all": "🌍 All Countries (Global)",
-                "us": "🇺🇸 United States",
-                "gb": "🇬🇧 United Kingdom",
-                "in": "🇮🇳 India",
-                "ca": "🇨🇦 Canada",
-                "au": "🇦🇺 Australia",
-                "de": "🇩🇪 Germany",
-                "fr": "🇫🇷 France",
-                "nl": "🇳🇱 Netherlands",
-                "es": "🇪🇸 Spain",
-                "it": "🇮🇹 Italy",
-                "br": "🇧🇷 Brazil",
-                "mx": "🇲🇽 Mexico",
-                "pl": "🇵🇱 Poland",
-                "za": "🇿🇦 South Africa",
-                "sg": "🇸🇬 Singapore",
-                "nz": "🇳🇿 New Zealand",
-            })
-            country = st.selectbox(
-                "Country / Region",
-                options=list(supported_countries.keys()),
-                format_func=lambda x: str(supported_countries.get(x, (x or "").upper())),
-                index=0,
-                key="ja_country"
-            )
+            
+        supported_countries = getattr(ja, "SUPPORTED_COUNTRIES", {
+            "all": "🌍 All Countries (Global)",
+            "us": "🇺🇸 United States",
+            "gb": "🇬🇧 United Kingdom",
+            "in": "🇮🇳 India",
+            "ca": "🇨🇦 Canada",
+            "au": "🇦🇺 Australia",
+            "de": "🇩🇪 Germany",
+            "fr": "🇫🇷 France",
+            "nl": "🇳🇱 Netherlands",
+            "es": "🇪🇸 Spain",
+            "it": "🇮🇹 Italy",
+            "br": "🇧🇷 Brazil",
+            "mx": "🇲🇽 Mexico",
+            "pl": "🇵🇱 Poland",
+            "za": "🇿🇦 South Africa",
+            "sg": "🇸🇬 Singapore",
+            "nz": "🇳🇿 New Zealand",
+        })
+        country = st.selectbox(
+            "Country / Region",
+            options=list(supported_countries.keys()),
+            format_func=lambda x: str(supported_countries.get(x, (x or "").upper())),
+            index=0,
+            key="ja_country"
+        )
         work_types = st.multiselect(
             "Work Type (leave empty for all)",
             options=[ja.REMOTE_WORLDWIDE, ja.REMOTE_IN_COUNTRY, ja.ONSITE_HYBRID, ja.CONTRACT],
@@ -1294,7 +1294,7 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
                 query = ja.SearchQuery(
                     title=title.strip(),
                     years_experience=int(yoe) if yoe else None,
-                    location=location.strip(),
+                    location="",
                     work_types=work_types,
                     country=country,
                 )
@@ -1511,15 +1511,16 @@ def _show_manual_jd_mode(email: str):
                     st.markdown(f"**{gap.get('area', '')}**")
                     if gap.get("why"):
                         st.caption(f"Why this matters: {gap['why']}")
-                    example = gap.get("example", "")
                     val = st.text_area(
                         gap.get("question", "Tell us more:"),
-                        value=example,
                         key=f"gap_manual_{gap.get('id', gap.get('area', ''))}",
+                        placeholder="Type your verified experience here based on your real experience…",
                         height=100,
                     )
+                    example = gap.get("example", "")
                     if example:
-                        st.caption("💡 *This answer was drafted from your CV — review and edit it to be accurate.*")
+                        st.markdown("**💡 Example Answer (based on your CV):**")
+                        st.info(example)
                     if val.strip():
                         answers[gap.get("area", "")] = val.strip()
 
@@ -1908,16 +1909,16 @@ def show_smart_job_match_page():
                 st.markdown(f"**{gap.get('area', '')}**")
                 if gap.get("why"):
                     st.caption(f"Why this matters: {gap['why']}")
-                example = gap.get("example", "")
                 st.text_area(
                     gap.get("question", "Tell us more:"),
-                    value=example,
                     key=f"gap_answer_{gap['id']}",
-                    placeholder="Type your verified experience here…",
+                    placeholder="Type your verified experience here based on your real experience…",
                     height=100,
                 )
+                example = gap.get("example", "")
                 if example:
-                    st.caption("💡 *This answer was drafted from your CV — review and edit it to be accurate.*")
+                    st.markdown("**💡 Example Answer (based on your CV):**")
+                    st.info(example)
 
         st.info(
             "Please provide accurate information based on your real experience. CVOLVE PRO can "

@@ -1,9 +1,6 @@
-"""
-search_engine/normalizer.py — Phase 1 & 2: Query Normalization & Search Variant Generation.
-"""
-
 from __future__ import annotations
 import re
+from functools import lru_cache
 from search_engine.config import ABBREVIATIONS, TECH_STANDARDIZATION, STOP_WORDS
 
 
@@ -39,10 +36,11 @@ def normalize_title(raw_title: str) -> str:
     return " ".join(normalized_words)
 
 
-def generate_search_variants(query_title: str) -> list[str]:
-    """Generate search title variants/aliases to improve recall across external APIs using Gemini."""
+@lru_cache(maxsize=128)
+def _generate_search_variants_cached(query_title: str) -> tuple[str, ...]:
+    """Internal cached helper for generating title variants."""
     if not query_title or not query_title.strip():
-        return []
+        return ()
 
     try:
         from utils import get_gemini_response
@@ -116,4 +114,9 @@ def generate_search_variants(query_title: str) -> list[str]:
             seen.add(clean_v.lower())
             deduped_variants.append(clean_v)
 
-    return deduped_variants
+    return tuple(deduped_variants)
+
+
+def generate_search_variants(query_title: str) -> list[str]:
+    """Generate search title variants/aliases to improve recall across external APIs using Gemini."""
+    return list(_generate_search_variants_cached(query_title))

@@ -174,13 +174,13 @@ def analyze_cv_jd_gaps(resume_text, job_description, language: str = "English", 
     Identify AT MOST {max_gaps} areas the JD clearly requires but the résumé shows no or weak
     evidence for. For each gap, write:
     1. ONE clear question the candidate can answer to supply real evidence.
-    2. A strong, PERSONALISED example answer written AS IF the candidate is replying,
+    2. A strong, ELABORATIVE, and PERSONALISED example answer written AS IF the candidate is replying,
        using specific details extracted from THEIR résumé (real project names, company names,
        tech stack, metrics, dates). The example answer MUST be:
        - Written in first person ("I led…", "At [Company], I…")
-       - 2-4 sentences long
+       - 3-5 elaborative sentences providing comprehensive context (scale, responsibilities, tools, and results)
        - Directly reference real experience from the résumé that is closest to the gap
-       - Ready to copy-paste with only minor edits needed by the candidate
+       - Detailed, complete, and professional so the candidate sees an ideal response
        - If the résumé has NO related experience at all for a gap, write
          "No direct experience found in your CV — please describe any related experience you have."
          instead of fabricating details.
@@ -192,7 +192,7 @@ def analyze_cv_jd_gaps(resume_text, job_description, language: str = "English", 
       "gaps": [
         {{"id": "<short_slug>", "area": "<missing area>", "why": "<why it is a gap>",
           "question": "<one clear question>",
-          "example": "<a personalised, first-person draft answer grounded in the candidate's CV>"}}
+          "example": "<an elaborative, personalised, first-person draft answer grounded in the candidate's CV>"}}
       ]
     }}
     If the résumé already covers the JD well, return "sufficient": true and an empty "gaps" list.

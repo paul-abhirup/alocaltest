@@ -156,6 +156,10 @@ class Job:
     relevance_score: Optional[int] = None
     title_similarity: Optional[float] = None
 
+    @property
+    def id(self) -> str:
+        return self.dedupe_key()
+
     def dedupe_key(self) -> str:
         u = _normalize_url(self.url)
         if u:
@@ -510,8 +514,9 @@ class JSearchAdapter(SourceAdapter):
         if query.location:
             q_text += f" in {query.location}"
 
-        num_pages = max(2, min(5, (query.limit + 9) // 10))
-        params = {"query": q_text, "page": "1", "num_pages": str(num_pages)}
+        # Request 1 page (10 results) per query variant to ensure sub-10s API response time
+        num_pages = "1"
+        params = {"query": q_text, "page": "1", "num_pages": num_pages}
         if query.country and query.country.lower() != "all":
             wants = set(query.work_types or [])
             # When only worldwide remote is selected, don't lock by country
@@ -522,14 +527,11 @@ class JSearchAdapter(SourceAdapter):
         if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
             params["remote_jobs_only"] = "true"
         try:
-            resp = requests.get(self.BASE, headers=headers, params=params, timeout=10)
+            resp = requests.get(self.BASE, headers=headers, params=params, timeout=15)
             resp.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                resp = requests.get("https://jsearch.p.rapidapi.com/search", headers=headers, params=params, timeout=10)
-                resp.raise_for_status()
-            else:
-                raise
+        except Exception as e:
+            logger.warning(f"JSearch API fetch failed: {e}")
+            return []
         data = resp.json()
         raw_data = data.get("data")
         if isinstance(raw_data, dict):
@@ -936,7 +938,7 @@ def _title_variants(query: SearchQuery) -> list[str]:
     return deduped[: MAX_VARIANTS_PER_SOURCE + 1] or [query.title]
 
 
-def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: float) -> tuple[list[Job], str]:
+def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: float, variants: Optional[list[str]] = None) -> tuple[list[Job], str]:
     """Fetch a single source across search variants.
 
     Returns (jobs, status) where status ∈ {"ok", "cached", "stale", "error", "auth"}.
@@ -945,7 +947,8 @@ def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: flo
     """
     collected: list[Job] = []
     status = "error"
-    for v_title in _title_variants(query):
+    query_variants = variants or _title_variants(query)
+    for v_title in query_variants:
         vq = copy.copy(query)
         vq.title = v_title
         ckey = f"{adapter.source}:{vq.cache_key([adapter.source])}"
@@ -1015,16 +1018,17 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
 
     collected: list[Job] = []
     status: dict[str, str] = {}
+    query_variants = _title_variants(query)
 
     max_workers = min(len(adapters), 6)
     if len(adapters) <= 1:
         for adapter in adapters:
-            jobs, st = _fetch_source(adapter, query, ttl, now)
+            jobs, st = _fetch_source(adapter, query, ttl, now, variants=query_variants)
             collected.extend(jobs)
             status[adapter.source] = st
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(_fetch_source, a, query, ttl, now): a for a in adapters}
+            futures = {ex.submit(_fetch_source, a, query, ttl, now, query_variants): a for a in adapters}
             for fut in as_completed(futures):
                 adapter = futures[fut]
                 try:
@@ -1109,12 +1113,13 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
     # Take top 20 candidate jobs and run a batch LLM prompt
     from search_engine.ranking.llm_reranker import evaluate_job_fit_batch
     top_candidates = filtered[:20]
-    if top_candidates:
-        llm_scores = evaluate_job_fit_batch(resume_text or "", query.title, top_candidates)
-        for job in top_candidates:
-            if str(job.id) in llm_scores:
+    if top_candidates and resume_text and resume_text.strip():
+        llm_scores = evaluate_job_fit_batch(resume_text, query.title, top_candidates)
+        for i, job in enumerate(top_candidates):
+            job_id = str(getattr(job, "id", None) or getattr(job, "url", None) or f"job_{i}")
+            if job_id in llm_scores:
                 # Combine hybrid match score and LLM re-rank score
-                llm_score = llm_scores[str(job.id)]
+                llm_score = llm_scores[job_id]
                 if isinstance(llm_score, (int, float)):
                     # Let LLM score have a 50% weight on the final match score for the top 20
                     current = job.match_score if job.match_score is not None else 50

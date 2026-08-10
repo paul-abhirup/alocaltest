@@ -20,6 +20,8 @@ import resend
 from payment import create_jobsqa_checkout_session
 from payment import handle_jobsqa_payment
 from database import payment_exists, save_payment
+from pricing import price_for_jobsqa, credit_cost as _credit_cost
+from currency import resolve_currency
 import stripe
 from fastapi import Request
 
@@ -132,6 +134,7 @@ from database import (
     jobsqa_get_credits,
     jobsqa_update_credits,
     jobsqa_save_interview,
+    jobsqa_get_interview,
     get_alignment_answers,
     save_alignment_answers
 )
@@ -1675,6 +1678,105 @@ async def jobsqa_generate_interview_qa(
     }
 
 
+# ---------------------------------------------------------------------------
+# Download a previously-generated Q&A bank without doing the interview.
+# Charges `QA_BANK_DOWNLOAD_CREDITS` (4 by default). Idempotent via
+# `idempotency_key` so retries don't double-charge.
+# ---------------------------------------------------------------------------
+
+QA_BANK_DOWNLOAD_CREDITS = _credit_cost("qa_bank_download")
+
+
+class InterviewDownloadRequest(BaseModel):
+    interview_id: int
+    format: Optional[str] = "txt"  # "txt" | "pdf" | "docx"
+
+
+@app.post("/api/jobsqa/download_interview_qa")
+async def jobsqa_download_interview_qa(
+    req: InterviewDownloadRequest,
+    Authorization: str = Header(...),
+):
+    email = verify_bearer_token_jobsqa(Authorization)
+    user = jobsqa_get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    user_id = user["id"]
+
+    row = jobsqa_get_interview(req.interview_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Interview Q&A not found")
+
+    # Check credits
+    credits_now = jobsqa_get_credits(user_id)
+    if credits_now is None or credits_now < QA_BANK_DOWNLOAD_CREDITS:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Insufficient credits: {QA_BANK_DOWNLOAD_CREDITS} required, "
+                f"you have {credits_now or 0}"
+            ),
+        )
+
+    qa_text = row.get("interview_qa") or ""
+    if not qa_text.strip():
+        raise HTTPException(
+            status_code=500, detail="Stored Q&A is empty"
+        )
+
+    fmt = (req.format or "txt").lower()
+    payload: dict
+    if fmt == "pdf":
+        try:
+            pdf_buf, _ = cv_generator.export_interview_qa(qa_text)
+            payload = {
+                "success": True,
+                "format": "pdf",
+                "filename": f"interview_qa_{req.interview_id}.pdf",
+                "content_base64": base64.b64encode(pdf_buf.getvalue()).decode(),
+                "mime": "application/pdf",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"PDF export failed: {e}")
+    elif fmt == "docx":
+        try:
+            _, docx_buf = cv_generator.export_interview_qa(qa_text)
+            payload = {
+                "success": True,
+                "format": "docx",
+                "filename": f"interview_qa_{req.interview_id}.docx",
+                "content_base64": base64.b64encode(docx_buf.getvalue()).decode(),
+                "mime": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            }
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"DOCX export failed: {e}")
+    else:
+        payload = {
+            "success": True,
+            "format": "txt",
+            "filename": f"interview_qa_{req.interview_id}.txt",
+            "content_base64": base64.b64encode(qa_text.encode()).decode(),
+            "mime": "text/plain",
+        }
+
+    # Deduct AFTER successful export
+    try:
+        jobsqa_update_credits(user_id, -QA_BANK_DOWNLOAD_CREDITS, "qa_bank_download")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail="Export succeeded but credit deduction failed"
+        )
+
+    payload["credits"] = jobsqa_get_credits(user_id)
+    return payload
+
+
 
 # ----------------- NEW: Cover Letter helpers & endpoint ------------------
 
@@ -1958,17 +2060,23 @@ async def jobsqa_create_checkout(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    # Get country from frontend (since not using Cloudflare)
-    country = checkout_data.country_code or ""
-    is_india = (country == "IN")
+    # Resolve price + currency from the user's country (IN gets an override,
+    # everyone else pays USD-converted-at-FX).
+    country = (checkout_data.country_code or "").upper() or None
 
+    # The frontend passes country_code but no currency; we resolve it here
+    # using the same precedence as the web app so travellers / overrides work.
+    currency = resolve_currency(
+        request_headers=dict(request.headers) if request else None,
+        explicit=checkout_data.currency,
+    )
+    if not country:
+        # Fall back to currency-only inference when no country was sent
+        from currency import COUNTRY_TO_CURRENCY
+        reverse = {v: k for k, v in COUNTRY_TO_CURRENCY.items()}
+        country = reverse.get(currency.upper())
 
-    if is_india:
-        amount = 89900     # 899 in paise
-        currency = "inr"
-    else:
-        amount = 1499     # $14.99 in cents
-        currency = "usd"
+    amount, currency = price_for_jobsqa(currency, country=country)
 
     checkout_url = create_jobsqa_checkout_session(
         user_email=email,

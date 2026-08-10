@@ -1566,6 +1566,27 @@ def jobsqa_save_interview(user_id: int, resume_filename: str, jd: str, qa: str):
         cur.close()
         conn.close()
 
+
+def jobsqa_get_interview(interview_id: int, user_id: int) -> dict | None:
+    """Fetch a previously-generated interview Q&A row by id, scoped to user."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, user_id, resume_filename, job_description, interview_qa,
+                   created_at
+            FROM jobsqa_interview_history
+            WHERE id = %s AND user_id = %s
+        """, (interview_id, user_id))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+    finally:
+        cur.close()
+        conn.close()
+
 def jobsqa_set_email_otp(email, otp):
     conn = get_db_connection()
     cur = conn.cursor()

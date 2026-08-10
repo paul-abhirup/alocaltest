@@ -54,12 +54,16 @@ def calculate_composite_score(
             candidate_target_role=target_role or query_title
         )
         
-        gemini_score = gemini_res.get("ats_score", 0)
         if not gemini_res.get("is_relevant_domain", True):
             domain_mismatch = True
 
-        # Tri-hybrid: 30% Keyword Overlap + 30% Vector Semantic + 40% Gemini ATS Score
-        hybrid_resume_score = (res_score * 0.3) + (semantic_sim * 0.3) + (gemini_score * 0.4)
+        if gemini_res.get("success", False):
+            # Tri-hybrid when Gemini AI is active: 30% Keyword Overlap + 30% Vector Semantic + 40% Gemini ATS Score
+            gemini_score = gemini_res.get("ats_score", 0)
+            hybrid_resume_score = (res_score * 0.3) + (semantic_sim * 0.3) + (gemini_score * 0.4)
+        else:
+            # Fallback when Gemini AI service is offline or unconfigured
+            hybrid_resume_score = (res_score * 0.4) + (semantic_sim * 0.6)
     else:
         hybrid_resume_score = 0.0
 

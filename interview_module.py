@@ -31,6 +31,8 @@ from credit_engine import (
 )
 import pricing
 
+QA_BANK_DOWNLOAD_CREDITS = pricing.credit_cost("qa_bank_download")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini model (shared with cv_generator)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1800,27 +1802,21 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
     # Download-only option (if bank already exists)
     if st.session_state.interview_qa_bank:
         st.markdown("---")
-        st.markdown("### 📁 Download Generated Q&A Bank")
+        st.markdown("### 📁 Download Previously Generated Q&A Bank")
         bank = st.session_state.interview_qa_bank
         resume_text = st.session_state.interview_resume_text
         jd_text = st.session_state.interview_jd
 
         # Convert structured bank to flat text for export
         flat_text = _qa_bank_to_text(bank)
-        try:
-            pdf_buf, docx_buf = export_qa_fn(flat_text)
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                st.download_button("📥 Download Q&A PDF", data=pdf_buf,
-                                   file_name="interview_qa_bank.pdf", mime="application/pdf",
-                                   key="dl_qa_pdf_setup")
-            with dc2:
-                st.download_button("📥 Download Q&A DOCX", data=docx_buf,
-                                   file_name="interview_qa_bank.docx",
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                   key="dl_qa_docx_setup")
-        except Exception as e:
-            st.warning(f"Export failed: {e}")
+        _render_qa_bank_download_gate(
+            flat_text=flat_text,
+            export_qa_fn=export_qa_fn,
+            cache_key="setup_qa_bank",
+            deduct_credits_fn=deduct_credits_fn,
+            file_base="interview_qa_bank",
+            section_label="Previously Generated Q&A Bank",
+        )
 
 
 def _transcribe_audio_deepgram(audio_bytes: bytes) -> str:
@@ -1942,21 +1938,132 @@ def _qa_bank_to_text(bank: dict) -> str:
     }
     for section in bank.keys():
         section_title = section_titles.get(section, section.title())
-        lines.append(f"\n{section_title}\n")
+        lines.append(f"\n=== {section_title} ===\n")
         qs = bank.get(section, [])
         for q in qs:
             lines.append(f"{idx}. {q.get('question', '')}")
-            answer = q.get("ideal_answer", "")
-            star = _split_star(answer)
-            if star:
-                lines.append("Suggested answer (STAR method):")
-                for label in _STAR_LABELS:
-                    lines.append(f"{label}: {star[label]}")
-            else:
-                lines.append(f"Suggested answer: {answer}")
+            lines.append(f"Answer: {q.get('ideal_answer', '')}")
             lines.append("")
             idx += 1
     return "\n".join(lines)
+
+
+def _make_credit_deduct_adapter():
+    """Return a `deduct_credits_fn(email, amount, feature)`-shaped callable
+    that routes through `credit_engine.spend_credits`.
+
+    The F2F phase doesn't get a `deduct_credits_fn` plumbed in (it bills via
+    F2F blocks), so we synthesise one that uses the credit engine directly.
+    Account type follows whatever the user has signed in as.
+    """
+    from credit_engine import spend_credits
+
+    def _deduct(email: str, amount: int, feature: str = "Q&A Bank Download") -> bool:
+        account_type = (
+            "business"
+            if st.session_state.get("account_type") == "business"
+            else "individual"
+        )
+        result = spend_credits(account_type, email, feature, amount=amount)
+        return bool(result.get("ok"))
+
+    return _deduct
+
+
+def _render_qa_bank_download_gate(
+    *,
+    flat_text: str,
+    export_qa_fn,
+    cache_key: str,
+    deduct_credits_fn,
+    file_base: str = "interview_qa_bank",
+    section_label: str = "Q&A Bank",
+):
+    """Charge `QA_BANK_DOWNLOAD_CREDITS` once per session, then render the
+    PDF/DOCX download buttons.
+
+    The button pair is hidden until the user has paid (or until the same
+    session_key has already been paid). The pay-once cache lives in
+    `st.session_state[cache_key + "_paid"]` and the rendered bytes in
+    `st.session_state[cache_key + "_bytes"]`.
+    """
+    paid_flag = f"{cache_key}_paid"
+    bytes_cache = f"{cache_key}_bytes"
+
+    # Already paid this session → render immediately
+    if st.session_state.get(paid_flag):
+        try:
+            pdf_buf, docx_buf = st.session_state[bytes_cache]
+            _render_qa_download_buttons(pdf_buf, docx_buf, file_base, cache_key)
+        except Exception as e:
+            st.warning(f"Export failed: {e}")
+        return
+
+    # Show the gate
+    st.markdown(
+        f"### 📥 Download {section_label}"
+    )
+    st.caption(
+        f"Downloading the full {section_label.lower()} costs "
+        f"**{QA_BANK_DOWNLOAD_CREDITS} credits**. "
+        f"You won't be charged again for this session."
+    )
+    email = st.session_state.get("user_data", {}).get("email", "")
+    user_email = email or "anonymous"
+    if st.button(
+        f"💳 Pay {QA_BANK_DOWNLOAD_CREDITS} credits & Download",
+        key=f"pay_{cache_key}",
+        type="primary",
+    ):
+        # Test-account bypass (matches app.check_user_access pattern)
+        is_test = (
+            user_email
+            and ("tester@cvolvepro.com" in user_email.lower()
+                 or "test" in user_email.lower())
+        )
+        if not is_test:
+            ok = deduct_credits_fn(
+                user_email,
+                QA_BANK_DOWNLOAD_CREDITS,
+                feature="Q&A Bank Download",
+            )
+            if not ok:
+                st.error(
+                    f"⚠️ You need {QA_BANK_DOWNLOAD_CREDITS} credits to download. "
+                    f"Please top up."
+                )
+                return
+        # Render & cache bytes for re-downloads in the same session
+        try:
+            pdf_buf, docx_buf = export_qa_fn(flat_text)
+            st.session_state[bytes_cache] = (pdf_buf, docx_buf)
+            st.session_state[paid_flag] = True
+            st.rerun()
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+
+
+def _render_qa_download_buttons(pdf_buf, docx_buf, file_base: str, cache_key: str):
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.download_button(
+            "📥 Download Q&A PDF",
+            data=pdf_buf,
+            file_name=f"{file_base}.pdf",
+            mime="application/pdf",
+            key=f"dl_{cache_key}_pdf",
+        )
+    with dc2:
+        st.download_button(
+            "📥 Download Q&A DOCX",
+            data=docx_buf,
+            file_name=f"{file_base}.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            key=f"dl_{cache_key}_docx",
+        )
 
 
 def _render_inline_feedback(q_obj: dict):
@@ -2181,21 +2288,18 @@ def _phase_f2f(export_qa_fn=None):
             for q in f2f_qs:
                 bank.setdefault(q.get("section", "general"), []).append(q)
             flat_text = _qa_bank_to_text(bank)
-            try:
-                pdf_buf, docx_buf = export_qa_fn(flat_text)
-                st.markdown("### 📥 Download Question Bank")
-                dc1, dc2 = st.columns(2)
-                with dc1:
-                    st.download_button("📥 Download Q&A PDF", data=pdf_buf,
-                                       file_name="f2f_question_bank.pdf", mime="application/pdf",
-                                       key="dl_f2f_pdf")
-                with dc2:
-                    st.download_button("📥 Download Q&A DOCX", data=docx_buf,
-                                       file_name="f2f_question_bank.docx",
-                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                       key="dl_f2f_docx")
-            except Exception as e:
-                st.warning(f"Export failed: {e}")
+            # F2F path doesn't have a deduct_credits_fn available; create a
+            # thin adapter that routes through the credit engine so the
+            # 4-credit charge is logged properly.
+            _deduct = _make_credit_deduct_adapter()
+            _render_qa_bank_download_gate(
+                flat_text=flat_text,
+                export_qa_fn=export_qa_fn,
+                cache_key="f2f_qa_bank",
+                deduct_credits_fn=_deduct,
+                file_base="f2f_question_bank",
+                section_label="F2F Question Bank",
+            )
 
         if st.button("↩️ Return to Setup", key="f2f_back_setup", use_container_width=True):
             _reset_interview_session()

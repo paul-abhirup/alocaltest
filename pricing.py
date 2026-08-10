@@ -2,7 +2,16 @@
 Single source of truth for plans, credit packs, per-feature credit costs and
 free-plan limits. All pricing logic in the app must read from here instead of
 hardcoding values.
+
+Currency handling:
+- Every plan / pack has a `price_usd` baseline.
+- For Indian visitors, a hardcoded INR price is preferred (see `INR_OVERRIDE`).
+- All other currencies are derived at runtime via `price_for(...)` using FX
+  rates from `fx.py`, rounded per the currency's natural precision.
 """
+
+from currency import minor_units_for, resolve_country
+from fx import convert
 
 CYCLE_DAYS = 30
 
@@ -103,6 +112,27 @@ LEGACY_PACK_MAP = {
     "Premium Pack": "Intensive Pack",
 }
 
+# ---------------------------------------------------------------------------
+# India pricing override
+# Indian visitors see hardcoded INR prices instead of USD * FX. Only the items
+# listed here get the override; everything else falls through to FX.
+# ---------------------------------------------------------------------------
+INR_OVERRIDE: dict[str, int | float] = {
+    "Career Pro":       699,
+    "Interview Pro":    1499,
+    "Quick Pack":       799,
+    "Sprint Pack":      1499,
+    "Intensive Pack":   2399,
+}
+
+JOBSQA_INR_OVERRIDE: int = 899  # JobsQA monthly in INR
+JOBSQA_USD_PRICE: float = 14.99
+
+# Corporate plans stay USD-only for now (business sales are negotiated).
+CORPORATE_USD_PRICES: dict[str, int] = {
+    "Starter": 149, "Growth": 299, "Pro": 449, "Plus": 699, "Enterprise": 999,
+}
+
 def pack_config(pack_name):
     target = LEGACY_PACK_MAP.get(pack_name, pack_name)
     for p in PACKS:
@@ -127,6 +157,7 @@ CREDIT_COSTS = {
     "interview_text_mock": 6,    # text mock interview (full run)
     "interview_star": 1,         # STAR-format feedback per answer
     "interview_improve_answer": 1,  # suggested improved answer per answer
+    "qa_bank_download": 4,       # downloading the Q&A bank without doing the interview
 }
 
 def credit_cost(feature):
@@ -147,3 +178,68 @@ INTERVIEW_QA_SESSION_CREDITS = {
 # Coupon offer handled specially by the billing page (legacy)
 # ---------------------------------------------------------------------------
 SPECIAL_OFFER_CODE = "PREMIUM599"
+
+
+# ---------------------------------------------------------------------------
+# Currency-aware pricing
+# ---------------------------------------------------------------------------
+def _round_for(amount: float, currency: str) -> float:
+    """Round an amount to the currency's natural precision (no FX)."""
+    decimals = minor_units_for(currency)
+    if decimals == 0:
+        return float(round(amount))
+    quantum = 10 ** decimals
+    return round(round(amount * quantum) / quantum, decimals)
+
+
+def price_for(
+    cfg: dict,
+    currency: str,
+    *,
+    country: str | None = None,
+    name_key: str = "name",
+) -> tuple[float, str]:
+    """Return (amount, currency_code) for a plan/pack config in `currency`.
+
+    Args:
+        cfg: Plan or pack dict (must have `price_usd`).
+        currency: Target ISO-4217 currency code (e.g. "EUR", "JPY", "INR").
+        country: ISO-3166 alpha-2 country code. If "IN" and the item has an
+            INR override, the hardcoded price is used.
+        name_key: Dict key that holds the display name (used to look up
+            INR override). Defaults to "name".
+
+    Returns:
+        (amount, currency_code) - amount is rounded to the currency's
+        natural precision.
+    """
+    cur = (currency or "USD").upper()
+    name = cfg.get(name_key)
+
+    # India override
+    if (country or "").upper() == "IN" and name and name in INR_OVERRIDE:
+        return float(INR_OVERRIDE[name]), "INR"
+
+    amount_usd = float(cfg.get("price_usd", 0.0))
+    if cur == "USD" or amount_usd == 0.0:
+        return _round_for(amount_usd, cur), cur
+
+    converted = convert(amount_usd, cur, base="USD")
+    return _round_for(converted, cur), cur
+
+
+def price_for_jobsqa(currency: str, *, country: str | None = None) -> tuple[int, str]:
+    """JobsQA-specific pricing (single product)."""
+    cur = (currency or "USD").upper()
+    if (country or "").upper() == "IN":
+        return JOBSQA_INR_OVERRIDE, "INR"
+    if cur == "USD":
+        # Stripe wants minor units (cents)
+        return int(round(JOBSQA_USD_PRICE * 100)), "USD"
+    amount = convert(JOBSQA_USD_PRICE, cur, base="USD")
+    return int(round(amount * (10 ** minor_units_for(cur)))), cur
+
+
+def country_from(*, request_headers=None, user_phone: str | None = None) -> str | None:
+    """Convenience wrapper around `currency.resolve_country`."""
+    return resolve_country(request_headers=request_headers, user_phone=user_phone)

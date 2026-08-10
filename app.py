@@ -35,6 +35,9 @@ from templates import apply_template
 from utils import optimize_keywords, enforce_page_limit, get_gemini_response, get_all_country_dial_codes
 from interview_module import show_interview_practice_page, _init_session as _init_interview_session
 import pricing
+import currency
+from currency import resolve_currency, resolve_country, format_amount as _format_amount, SUPPORTED_CURRENCIES, symbol_for
+from pricing import price_for, CORPORATE_USD_PRICES, price_for_jobsqa
 try:
     import extra_streamlit_components as stx
 except Exception:
@@ -2424,66 +2427,49 @@ def show_admin_vouchers_page(admin_email):
 
 
 def show_billing_page():
-    """Billing and subscription management with Stripe + simple currency selection"""
+    """Billing and subscription management with Stripe + currency localization"""
 
-    # ---- Currency: safe, local-friendly (no JS, no early return) ----
-    cur_param = st.query_params.get("cur", None)
-    if not cur_param:
-        # Best-effort first guess from phone prefix while local/testing
-        phone = (st.session_state.get("user_data", {}).get("phone") or "").strip()
-        prefix_map = {
-            "+91": "INR",   # India
-            "+971": "AED",  # UAE
-            "+973": "BHD",  # Bahrain
-            "+61": "AUD",   # Australia
-            "+44": "GBP",   # UK
-        }
-        guess = "USD"
-        for pref, code in prefix_map.items():
-            if phone.startswith(pref):
-                guess = code
-                break
-        st.query_params["cur"] = guess  # triggers a rerun
+    # ---- Currency: geo + manual override, single source of truth ----
+    phone = (st.session_state.get("user_data", {}).get("phone") or "").strip()
 
-    cur_param = st.query_params.get("cur", "USD")
-    if isinstance(cur_param, list):
-        cur_param = cur_param[0]
+    # Pull request headers if Streamlit exposes them; otherwise rely on
+    # phone + manual override (CF headers are still read when present).
+    request_headers: dict[str, str] = {}
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is not None and getattr(ctx, "headers", None):
+            request_headers = {k: v for k, v in ctx.headers.items()}
+    except Exception:
+        request_headers = {}
 
-    SUPPORTED = ("INR", "EUR", "USD", "AED", "BHD", "AUD", "GBP")
-    CURRENT_CURRENCY = cur_param if cur_param in SUPPORTED else "USD"
+    country = resolve_country(request_headers=request_headers, user_phone=phone)
 
-    SYMBOL = {
-        "USD": "$", "INR": "₹", "EUR": "€",
-        "AED": "د.إ", "BHD": "BD", "AUD": "A$", "GBP": "£",
-    }[CURRENT_CURRENCY]
+    CURRENT_CURRENCY = resolve_currency(
+        query_params=dict(st.query_params),
+        request_headers=request_headers,
+        user_phone=phone,
+    )
 
-    # Simple static USD→local multipliers (adjust anytime)
-    RATE = {
-        "USD": 1.00,
-        "INR": 84.00,
-        "EUR": 0.92,
-        "AED": 3.67,
-        "BHD": 0.38,
-        "AUD": 1.50,
-        "GBP": 0.78,
-    }[CURRENT_CURRENCY]
-
-    THREE_DECIMAL = {"BHD"}  # BHD uses 3 decimals
-
-    def price_local(usd_amount: float) -> float:
-        v = usd_amount * RATE
-        if CURRENT_CURRENCY == "INR":
-            return round(v)           # whole rupees
-        if CURRENT_CURRENCY in THREE_DECIMAL:
-            return round(v, 3)        # e.g., BHD
-        return round(v, 2)            # default 2-decimal
+    SYMBOL = symbol_for(CURRENT_CURRENCY)
 
     def fmt(amount_local: float) -> str:
-        if CURRENT_CURRENCY == "INR":
-            return f"{SYMBOL}{amount_local:,.0f}"
-        if CURRENT_CURRENCY in THREE_DECIMAL:
-            return f"{SYMBOL}{amount_local:,.3f}"
-        return f"{SYMBOL}{amount_local:,.2f}"
+        return _format_amount(amount_local, CURRENT_CURRENCY)
+
+    # Manual override selector (small UI affordance for travellers)
+    with st.popover(f"🌐 {SYMBOL} {CURRENT_CURRENCY}", use_container_width=False):
+        st.caption("Currency")
+        sel = st.selectbox(
+            "Currency",
+            options=list(SUPPORTED_CURRENCIES),
+            index=list(SUPPORTED_CURRENCIES).index(CURRENT_CURRENCY)
+            if CURRENT_CURRENCY in SUPPORTED_CURRENCIES
+            else list(SUPPORTED_CURRENCIES).index("USD"),
+            key="currency_override",
+            label_visibility="collapsed",
+        )
+        if sel != CURRENT_CURRENCY:
+            st.query_params["cur"] = sel
+            st.rerun()
 
     # ---- Make sure we have a user while testing locally ----
     if "user_data" not in st.session_state:
@@ -2761,9 +2747,7 @@ def show_billing_page():
                     """
                 )
 
-            business_prices = {
-                "Starter": 149, "Growth": 299, "Pro": 449, "Plus": 699, "Enterprise": 999,
-            }
+            business_prices = CORPORATE_USD_PRICES
             _duration_label = lambda days: ("3 Months" if days <= 90
                                             else ("6 Months" if days <= 180 else "1 Year"))
             business_plans = [
@@ -2778,7 +2762,18 @@ def show_billing_page():
 
             for plan in business_plans:
 
-                local_price = price_local(plan["price"])
+                local_price, display_currency = price_for(
+                    {"price_usd": plan["price"]},
+                    CURRENT_CURRENCY,
+                    country=country,
+                    name_key="name",
+                )
+                if display_currency != CURRENT_CURRENCY:
+                    display_symbol = symbol_for(display_currency)
+                    display_fmt = lambda v: _format_amount(v, display_currency)
+                else:
+                    display_symbol = SYMBOL
+                    display_fmt = fmt
 
                 with st.container(border=True):
 
@@ -2794,7 +2789,7 @@ def show_billing_page():
                         )
 
                         st.markdown(
-                            f"## {fmt(local_price)}"
+                            f"## {display_fmt(local_price)}"
                         )
 
                         st.write(f"✅ {plan['credits']} AI Credits")
@@ -2821,7 +2816,7 @@ def show_billing_page():
                                 success_url=f"{base_url}?success=true&type=business",
                                 cancel_url=f"{base_url}?canceled=true",
                                 credits=plan["credits"],
-                                currency=CURRENT_CURRENCY,
+                                currency=display_currency,
                                 plan_name=plan["name"],
                                 duration=plan["duration"]
                             )
@@ -2839,10 +2834,13 @@ def show_billing_page():
             st.stop()
         st.markdown("#### 💎 Credit Packs")
         for pack in pricing.PACKS:
-            local_amount = price_local(pack["price_usd"])
+            local_amount, display_currency = price_for(
+                pack, CURRENT_CURRENCY, country=country, name_key="name"
+            )
+            display_symbol = symbol_for(display_currency)
             with st.container(border=True):
                 st.markdown(f"### 🧩 {pack['name']}")
-                st.markdown(f"## {fmt(local_amount)}")
+                st.markdown(f"## {_format_amount(local_amount, display_currency)}")
                 st.write(f"✅ {pack['credits']} AI Credits")
                 st.write(f"✅ Valid {pack['valid_days']} days")
                 if st.button(f"Buy {pack['name']}", key=f"buy_{pack['name'].replace(' ', '_')}"):
@@ -2854,7 +2852,7 @@ def show_billing_page():
                         cancel_url=f"{base_url}?canceled=true",
                         credits=pack["credits"],
                         pack=pack["name"],
-                        currency=CURRENT_CURRENCY                # INR/EUR/USD/AED/BHD/AUD/GBP
+                        currency=display_currency
                     )
                     if url:
                         st.markdown(f"💳 [Pay securely via Stripe]({url})", unsafe_allow_html=True)
@@ -2979,14 +2977,10 @@ def show_billing_page():
                 }.get(reason, f"Could not redeem (reason: {reason}).")
                 voucher_msg.error(f"❌ {friendly}")
 
-        phone = (st.session_state.get("user_data", {}).get("phone") or "").strip()
-        is_india_user = phone.startswith("+91")
-
         for plan_name, cfg in pricing.PLANS.items():
             # Voucher-only plans aren't user-buyable — activated via redemption above.
             if cfg.get("voucher_only"):
                 continue
-            price_usd = cfg["price_usd"]
 
             special_discount = get_user_special_discount(
                 user_email,
@@ -2998,34 +2992,24 @@ def show_billing_page():
                 special_discount
             )
 
-            if is_india_user:
+            base_local, display_currency = price_for(
+                {"price_usd": cfg["price_usd"], "name": plan_name},
+                CURRENT_CURRENCY,
+                country=country,
+                name_key="name",
+            )
+            display_symbol = symbol_for(display_currency)
+            base_str = _format_amount(base_local, display_currency)
 
-                base_local = cfg["price_inr"]
+            discount_factor = (1 - effective_discount / 100.0) if effective_discount else 1.0
+            final_local = (
+                round(base_local * discount_factor)
+                if display_currency == "INR"
+                else round(base_local * discount_factor, 2)
+            )
+            final_str = _format_amount(final_local, display_currency)
 
-                final_local = round(
-                    base_local * (1 - effective_discount / 100.0)
-                )
-
-                display_currency = "INR"
-                display_symbol = "₹"
-
-            else:
-
-                base_local = price_local(price_usd)
-
-                effective_usd = price_usd * (
-                    1 - effective_discount / 100.0
-                )
-
-                final_local = price_local(
-                    effective_usd
-                )
-
-                display_currency = CURRENT_CURRENCY
-                display_symbol = SYMBOL
-
-            with st.expander(f"{plan_name} – {display_symbol}{base_local:,.0f}" if display_currency == "INR"
-                            else f"{plan_name} – {fmt(base_local)}"):
+            with st.expander(f"{plan_name} – {base_str}"):
 
                 st.markdown("✅ Premium AI Model")
                 st.markdown(f"✅ {cfg['monthly_credits']} Credits / month")
@@ -3045,28 +3029,25 @@ def show_billing_page():
                     )
 
                     st.markdown(
-                        f"~~{display_symbol}{base_local:,.0f}~~ → "
-                        f"**{display_symbol}{final_local:,.0f}**"
+                        f"~~{base_str}~~ → **{final_str}**"
                     )
 
                 if st.button(
-                    f"Subscribe to {plan_name} – "
-                    f"{display_symbol}{final_local:,.0f}" if display_currency == "INR"
-                    else f"Subscribe to {plan_name} – {fmt(final_local)}",
+                    f"Subscribe to {plan_name} – {final_str}",
                     key=f"sub_{plan_name.replace(' ','_')}"
                 ):
                     success_url = f"{base_url}?success=true&type=subscription&plan={urllib.parse.quote_plus(plan_name)}"
                     cancel_url  = f"{base_url}?canceled=true"
 
-                    
+
                     session_url = create_checkout_session(
                         user_email=user_email,
-                        amount=final_local,              # ✅ ₹699 / ₹1499 or converted value
+                        amount=final_local,
                         payment_type="subscription",
                         success_url=success_url,
                         cancel_url=cancel_url,
                         plan=plan_name,
-                        currency=display_currency        # ✅ INR for India, else converted currency
+                        currency=display_currency
                     )
 
                     fixed_root_hop = "https://cvolvepro.com/?trk=subscribe_click"

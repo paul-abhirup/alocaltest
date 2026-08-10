@@ -50,6 +50,7 @@ FEATURE_ALIASES = {
     "Text Mock Interview": "interview_text_mock",
     "STAR Answer": "interview_star",
     "Improve Answer": "interview_improve_answer",
+    "Q&A Bank Download": "qa_bank_download",
     "F2F Interview": "cv_tailor",  # F2F charges explicit block credits
 }
 

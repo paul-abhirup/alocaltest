@@ -124,7 +124,8 @@ Respond ONLY in valid JSON format:
             "skill_match": skill_match,
             "experience_fit": experience_fit,
             "reasoning": str(result.get("reasoning", "")),
-            "is_relevant_domain": is_relevant
+            "is_relevant_domain": is_relevant,
+            "success": True
         }
 
         _score_cache[cache_key] = (now, sanitized_result)
@@ -134,9 +135,11 @@ Respond ONLY in valid JSON format:
         print(f"Gemini ATS Scorer error: {e}")
         return {
             "ats_score": 0,
-            "role_alignment": 0,
-            "skill_match": 0,
-            "experience_fit": 0,
+            "role_alignment": 50,
+            "skill_match": 50,
+            "experience_fit": 50,
             "reasoning": "AI scoring fallback",
-            "is_relevant_domain": True
+            "is_relevant_domain": True,
+            "success": False
         }
+

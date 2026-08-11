@@ -48,6 +48,77 @@ DURATION_CREDITS = {
     "45 minutes": 12,
 }
 
+# Credits for the download-only "Question Bank" option (no live session).
+# Kept separate from the 5/8/12 session tiers so charging stays independent.
+QA_BANK_ONLY_CREDITS = 4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAR-format suggested answers
+# ─────────────────────────────────────────────────────────────────────────────
+_STAR_LABELS = ("Situation", "Task", "Action", "Result")
+
+
+def _star_answer(situation: str, task: str, action: str, result: str) -> str:
+    """Build a STAR-structured suggested answer with the four labeled sections."""
+    return (
+        f"**Situation:** {situation}\n\n"
+        f"**Task:** {task}\n\n"
+        f"**Action:** {action}\n\n"
+        f"**Result:** {result}"
+    )
+
+
+def _split_star(answer: str):
+    """Extract the four STAR sections from an ideal_answer string.
+
+    Accepts both '**Situation:** ...' and plain 'Situation: ...' markers on their
+    own lines (or an all-on-one-line version). Returns a dict {label: text} when
+    all four sections are present and non-empty, otherwise None.
+    """
+    if not answer:
+        return None
+    label_re = re.compile(
+        r"^\s*\*{0,2}\s*(Situation|Task|Action|Result)\s*[:：\-–—]\s*\*{0,2}\s*(.*)$",
+        re.IGNORECASE,
+    )
+    sections = {}
+    current = None
+    for raw in answer.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = label_re.match(line)
+        if m:
+            current = m.group(1).title()
+            sections.setdefault(current, [])
+            if m.group(2).strip():
+                sections[current].append(m.group(2).strip())
+            continue
+        if current:
+            sections[current].append(line)
+
+    def _clean(lines):
+        return "\n".join(
+            ln for ln in lines
+            if ln.strip() and not re.match(r"^\s*\[.*\]\s*$", ln.strip())
+        ).strip()
+
+    if all(label in sections and _clean(sections[label]) for label in _STAR_LABELS):
+        result = {label: _clean(sections[label]) for label in _STAR_LABELS}
+        if all(result.values()):
+            return result
+
+    # Single-line fallback: "Situation: ... Task: ... Action: ... Result: ..."
+    single = re.match(
+        r".*?Situation\s*[:：\-–—]\s*(.*?)\s+Task\s*[:：\-–—]\s*(.*?)\s+Action\s*[:：\-–—]\s*(.*?)\s+Result\s*[:：\-–—]\s*(.*)$",
+        answer,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if single and all(g.strip() for g in single.groups()):
+        return dict(zip(_STAR_LABELS, (g.strip() for g in single.groups())))
+    return None
+
 # Question counts: behavioral = 10 behavioral + 5 resume; technical = 10 technical + 5 resume
 QUESTION_COUNTS = {
     "behavioral": {"behavioral": 10, "resume": 5},
@@ -138,7 +209,12 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                     demo_questions.append({
                         "question": t,
                         "difficulty": diff,
-                        "ideal_answer": f"I have practical experience with {phrase}. My approach involves understanding requirements, applying best practices, and iterating based on feedback. I focus on delivering reliable, maintainable results.",
+                        "ideal_answer": _star_answer(
+                            f"While working on production applications, I regularly applied {phrase} in a real project context.",
+                            f"The goal was to use {phrase} to deliver a reliable, maintainable solution that met the role's requirements.",
+                            f"I broke down the requirements, studied the best practices for {phrase}, implemented a clean solution, and iterated on feedback while testing against real edge cases.",
+                            f"The result was a dependable {phrase}-based feature that cut turnaround time and improved code quality with measurable impact.",
+                        ),
                         "key_points": [f"Practical experience with {phrase}", "Best practices", "Problem-solving", "Quality focus", "Continuous improvement"],
                     })
 
@@ -159,7 +235,12 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                     demo_questions.append({
                         "question": stem,
                         "difficulty": diff,
-                        "ideal_answer": "My technical background aligns well with this role. I have hands-on experience with relevant technologies and have delivered measurable results in past projects.",
+                        "ideal_answer": _star_answer(
+                            "In a previous role I worked on projects that directly exercised my technical skill set.",
+                            "I needed to solve a complex problem and connect my hands-on experience to this role's technical requirements.",
+                            "I broke the problem into pieces, applied the relevant technologies from my background, and iterated with the team until the solution was solid.",
+                            "The project shipped successfully with measurable improvements, showing how my past experience maps directly to this position.",
+                        ),
                         "key_points": ["Technical depth", "Project experience", "Problem-solving", "Results orientation", "Continuous learning"],
                     })
 
@@ -204,7 +285,12 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                     demo_questions.append({
                         "question": q_text,
                         "difficulty": diff,
-                        "ideal_answer": "I approach this by focusing on clear communication, empathy, and results. I believe in understanding the situation fully before acting, and I always follow up to ensure positive outcomes.",
+                        "ideal_answer": _star_answer(
+                            "This situation came up during a project where collaboration, clear communication, and alignment were critical.",
+                            "My responsibility was to handle it with empathy, transparent communication, and a results-driven approach.",
+                            "I listened carefully to understand the full context, communicated openly with everyone involved, took ownership of my part, and followed up until a positive outcome was reached.",
+                            "The team stayed aligned, the issue was resolved cleanly, and the working relationships came out stronger as a result.",
+                        ),
                         "key_points": ["Self-awareness", "Communication", "Teamwork", "Problem-solving", "Growth mindset"],
                     })
 
@@ -226,7 +312,12 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                     demo_questions.append({
                         "question": stem,
                         "difficulty": diff,
-                        "ideal_answer": "My career journey has been driven by a passion for learning and growth. Each role has contributed to my skill set, and I am excited to bring this experience to the new challenges this position offers.",
+                        "ideal_answer": _star_answer(
+                            "My career has been driven by a genuine passion for learning and growth across every role I've taken.",
+                            "The goal was to build a strong foundation of skills and experience that would prepare me for increasingly senior responsibilities.",
+                            "I sought out challenging projects, learned continuously, and took ownership of outcomes while collaborating across teams.",
+                            "Each role sharpened my skill set and delivered measurable results, positioning me to take on the challenges this position offers.",
+                        ),
                         "key_points": ["Career narrative", "Self-awareness", "Growth mindset", "Relevant experience", "Role alignment"],
                     })
 
@@ -253,7 +344,12 @@ def _demo_ai_response(prompt: str, json_mode: bool) -> str:
                 demo_questions.append({
                     "question": q_text,
                     "difficulty": diff,
-                    "ideal_answer": "I approach this by focusing on clear communication, empathy, and results. I believe in understanding the situation fully before acting, and I always follow up to ensure positive outcomes.",
+                    "ideal_answer": _star_answer(
+                        "This came up during a busy project where priorities were clear and expectations were high.",
+                        "I needed to respond with clear communication, empathy, and a results-driven approach to keep things moving.",
+                        "I assessed the situation, communicated openly with the team, took concrete action on my part, and followed up to verify a positive outcome.",
+                        "The team reached its goal and the process improved for future work as a result.",
+                    ),
                     "key_points": generic_kp,
                 })
 
@@ -651,7 +747,7 @@ OUTPUT FORMAT (strict JSON only, no markdown, no extra text):
     {{
       "question": "...",
       "difficulty": "{difficulty}",
-      "ideal_answer": "A complete well-structured answer (200-250 words)...",
+      "ideal_answer": "A 200-250 word answer composed of the four STAR sections (each labeled, each on its own line — see CRITICAL RULES below)...",
       "key_points": ["key point 1", "key point 2", "key point 3", "key point 4", "key point 5"]
     }}
   ],
@@ -661,6 +757,15 @@ OUTPUT FORMAT (strict JSON only, no markdown, no extra text):
 INTERVIEW TYPE: {cat1_label}
 
 CRITICAL RULES — Follow these EXACTLY:
+
+**STAR-STRUCTURED SUGGESTED ANSWERS (REQUIRED for EVERY question — BOTH interview types):**
+- The `ideal_answer` MUST be structured using the STAR method, with the four labels appearing literally as its own line/paragraph inside the string:
+  **Situation:** <2-3 sentences of background/context>
+  **Task:** <1-2 sentences on what needed to be done>
+  **Action:** <2-4 sentences of the specific steps the candidate took>
+  **Result:** <the outcome, ideally with a measurable impact/metric>
+- Every answer — for BOTH the {cat1_name} questions AND the resume-based questions — must use exactly this labeled four-section format.
+- Never collapse the answer into a single unlabeled paragraph. Keep each STAR section short (1-3 sentences) with a bold label.
 
 {cat1_instructions}
 
@@ -673,7 +778,7 @@ CRITICAL RULES — Follow these EXACTLY:
 
 ADDITIONAL REQUIREMENTS:
 - ALL {cat1_count + res_count} questions must be unique and non-repetitive.
-- ideal_answer: 200-250 words, comprehensive, well-structured.
+- ideal_answer: 200-250 words, comprehensive, well-structured, formatted as the four labeled STAR sections described above.
 - key_points: 5-7 essential concepts/keywords the answer must cover.
 - Do NOT include numbering inside question text.
 - If the JD or resume is thin, infer reasonable questions based on what IS provided — never fill with generic questions.
@@ -683,7 +788,7 @@ PERSONALIZATION — EVERY ideal_answer MUST be grounded in the candidate's RESUM
 - Base it on the candidate's ACTUAL roles, companies, projects, technologies, skills, and achievements listed in the RESUME below.
 - Every answer MUST reference at least one specific item from the resume (a role, company, project, tool, metric, or accomplishment).
 - Tie the candidate's resume experience directly to the job description: show how their past work maps to what this job asks for.
-- Structure behavioral answers using STAR (Situation, Task, Action, Result), filling in specifics from the resume.
+- Structure EVERY ideal_answer using the STAR labels (Situation, Task, Action, Result — one labeled section per line), filling in specifics from the resume for all four sections.
 - For technical questions, the answer must describe how the candidate has actually used the relevant tool/concept in their resume projects/roles, plus best practice.
 - If the resume lacks a specific fact the answer needs (e.g. an exact metric, team size, or technology), write the example with a clearly-marked placeholder in SQUARE BRACKETS, e.g. "[e.g. reduced query latency by 40%]" or "[e.g. a 6-person team]", so the user can fill in their real number.
 - NEVER write a generic model answer that ignores the resume. The answer must read like this specific candidate's own strong answer.
@@ -1426,7 +1531,7 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
     """, unsafe_allow_html=True)
 
     # ─── Credit Info Banner ───────────────────────────────────────────────────
-    col_c1, col_c2, col_c3 = st.columns(3)
+    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
     with col_c1:
         st.markdown("""<div class="interview-credit-card">
             <div class="interview-credit-value">5 Credits</div>
@@ -1439,6 +1544,10 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
         st.markdown("""<div class="interview-credit-card">
             <div class="interview-credit-value">12 Credits</div>
             <div class="interview-credit-sub">45-minute session</div></div>""", unsafe_allow_html=True)
+    with col_c4:
+        st.markdown("""<div class="interview-credit-card">
+            <div class="interview-credit-value">4 Credits</div>
+            <div class="interview-credit-sub">📥 Question Bank Only</div></div>""", unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### ⚙️ Session Configuration")
@@ -1510,6 +1619,53 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
         </ul>
         </div>
         """, unsafe_allow_html=True)
+
+    # ─── Question Bank Only (download-only, no live session) ─────────────────
+    st.markdown("---")
+    st.markdown("### 📥 Question Bank Only — 4 Credits")
+    st.caption(
+        "Get the full 15-question Q&A bank (with STAR-format suggested answers) "
+        "as a downloadable PDF — no live session, no credits used on interview practice."
+    )
+    qa_bank_ready = bool(jd.strip()) and (uploaded or resume_text_available)
+    if qa_bank_ready:
+        if st.button("📄 Generate & Download Question Bank Only (4 credits)",
+                     type="primary", key="qa_bank_only_btn", use_container_width=True):
+            if not check_access_fn(required_credits=QA_BANK_ONLY_CREDITS):
+                st.error(f"⚠️ You need {QA_BANK_ONLY_CREDITS} credits for the Question Bank Only download. Please top up.")
+                return
+            with st.spinner("🤖 AI is generating your personalized question bank..."):
+                try:
+                    if uploaded:
+                        qb_resume_text = extract_resume_fn(uploaded)
+                    else:
+                        qb_resume_text = st.session_state.get("interview_resume_text", "")
+                    st.session_state.interview_resume_text = qb_resume_text
+
+                    qb_bank = generate_structured_interview_qa(
+                        qb_resume_text, jd, duration,
+                        st.session_state.interview_type,
+                        st.session_state.get("interview_difficulty", "medium"),
+                    )
+                    st.session_state.interview_qa_bank = qb_bank
+                except Exception as e:
+                    st.session_state.interview_qa_bank = None
+                    st.error(f"❌ Failed to generate questions: {str(e)}")
+
+            if st.session_state.get("interview_qa_bank"):
+                flat = flatten_questions(st.session_state.interview_qa_bank)
+                if not flat:
+                    st.session_state.interview_qa_bank = None
+                    st.error("⚠️ No interview questions could be generated. No credits were charged. Please try again.")
+                else:
+                    user_email = st.session_state.user_data["email"]
+                    if deduct_credits_fn(user_email, QA_BANK_ONLY_CREDITS, feature="Question Bank Only"):
+                        st.success(f"✅ {len(flat)} questions generated. {QA_BANK_ONLY_CREDITS} credits used. Your downloads are below ↓")
+                    else:
+                        st.session_state.interview_qa_bank = None
+                        st.error("⚠️ Credit deduction failed. No credits were used. Please try again.")
+    else:
+        st.info("👆 Upload a resume and enter a job description above to unlock the Question Bank Only download.")
 
     # ─── Live F2F Mock Interview ──────────────────────────────────────────────
     st.markdown("---")
@@ -1644,7 +1800,7 @@ def _phase_setup(check_access_fn, deduct_credits_fn, extract_resume_fn, export_q
     # Download-only option (if bank already exists)
     if st.session_state.interview_qa_bank:
         st.markdown("---")
-        st.markdown("### 📁 Download Previously Generated Q&A Bank")
+        st.markdown("### 📁 Download Generated Q&A Bank")
         bank = st.session_state.interview_qa_bank
         resume_text = st.session_state.interview_resume_text
         jd_text = st.session_state.interview_jd
@@ -1780,17 +1936,24 @@ def _qa_bank_to_text(bank: dict) -> str:
     idx = 1
     section_titles = {
         "general": "General Questions",
-        "technical": "Technical Questions (JD-based)",
-        "behavioral": "Behavioral / Situational Questions",
+        "technical": "Technical Questions",
+        "behavioral": "Behavioral Questions",
         "resume": "Resume-based Questions",
     }
     for section in bank.keys():
         section_title = section_titles.get(section, section.title())
-        lines.append(f"\n=== {section_title} ===\n")
+        lines.append(f"\n{section_title}\n")
         qs = bank.get(section, [])
         for q in qs:
             lines.append(f"{idx}. {q.get('question', '')}")
-            lines.append(f"Answer: {q.get('ideal_answer', '')}")
+            answer = q.get("ideal_answer", "")
+            star = _split_star(answer)
+            if star:
+                lines.append("Suggested answer (STAR method):")
+                for label in _STAR_LABELS:
+                    lines.append(f"{label}: {star[label]}")
+            else:
+                lines.append(f"Suggested answer: {answer}")
             lines.append("")
             idx += 1
     return "\n".join(lines)
@@ -1896,23 +2059,48 @@ def _demo_questions():
     return [
         {"section": "behavioral", "difficulty": "Simple",
          "question": "Tell me about yourself and your professional background.",
-         "ideal_answer": "A concise STAR-structured summary covering experience, key achievements, and why you fit the role.",
+         "ideal_answer": _star_answer(
+             "In my most recent role I delivered projects with clear scope and measurable goals.",
+             "I needed to present my experience, key achievements, and motivations concisely and connect them to the role.",
+             "I prepared a STAR-structured summary, picked measurable achievements, and tied each one to the role's requirements with specific examples.",
+             "The interviewer got a clear picture of my fit, and the conversation moved quickly to role-specific depth questions.",
+         ),
          "key_points": ["Relevant experience", "Measurable achievements", "Alignment with the role"]},
         {"section": "behavioral", "difficulty": "Hard",
          "question": "Describe a time you faced a major challenge at work and how you handled it.",
-         "ideal_answer": "Use the STAR format: Situation, Task, Action, Result, with a concrete measurable outcome.",
+         "ideal_answer": _star_answer(
+             "A high-stakes project hit an unexpected blocker that threatened our deadline.",
+             "My task was to resolve the challenge and keep the project on track without compromising quality.",
+             "I split the problem into root causes, coordinated with stakeholders for input, and drove a focused mitigation plan with clear owners.",
+             "We recovered the timeline and shipped the milestone, with a measurable reduction in rework as a result.",
+         ),
          "key_points": ["Clear situation", "Your specific action", "Quantified result"]},
         {"section": "behavioral", "difficulty": "Simple",
          "question": "Why do you want this role, and what makes you a good fit?",
-         "ideal_answer": "Connect your skills and experience to the role's key requirements with specific examples.",
+         "ideal_answer": _star_answer(
+             "I've researched this role and the company's mission and saw a direct overlap with my background.",
+             "My goal was to show how my skills map to the role's key requirements with concrete proof.",
+             "I matched my past projects and achievements against each core requirement and prepared specific examples.",
+             "The interviewer saw a clear, evidence-backed fit rather than a generic answer.",
+         ),
          "key_points": ["Company/role research", "Skill-to-job mapping", "Enthusiasm"]},
         {"section": "behavioral", "difficulty": "Very Hard",
          "question": "Tell me about a time you had to lead or influence a team without formal authority.",
-         "ideal_answer": "Describe how you built trust, communicated a vision, and delivered results through others.",
+         "ideal_answer": _star_answer(
+             "A cross-functional initiative needed direction, but I wasn't the assigned lead.",
+             "My task was to rally the team and move the initiative forward without formal authority.",
+             "I built trust by listening first, communicated a clear and credible vision, and enabled each person to contribute their expertise toward the shared goal.",
+             "The team delivered the initiative on time, and the outcome demonstrated effective influence through others.",
+         ),
          "key_points": ["Influence strategy", "Stakeholder management", "Outcome"]},
         {"section": "behavioral", "difficulty": "Simple",
          "question": "Where do you see yourself in five years?",
-         "ideal_answer": "A growth-oriented answer that aligns your ambitions with the company's trajectory.",
+         "ideal_answer": _star_answer(
+             "I'm early-mid career and have been consistently growing through increasingly complex projects.",
+             "My goal is a trajectory that aligns my career ambitions with the company's direction.",
+             "I set a development plan covering the skills and responsibilities I want to take on, and I've been stepping into them progressively.",
+             "While I stay goal-focused, I remain flexible, so my five-year outlook is aligned with where the company is heading.",
+         ),
          "key_points": ["Career direction", "Growth plan", "Fit with company"]},
     ]
 

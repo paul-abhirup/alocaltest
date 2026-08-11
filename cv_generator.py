@@ -5,7 +5,7 @@ import hashlib
 import time
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 import PyPDF2 as pdf
 from docx import Document
 import google.generativeai as genai
@@ -237,8 +237,8 @@ class CVOptimization(BaseModel):
 class CVOptimizationResult(BaseModel):
     """Structured result for the closed-loop CV optimizer."""
     optimized_content: str
-    ats_score: int | None = None
-    keyword_match: int | None = None
+    ats_score: Optional[int] = None
+    keyword_match: Optional[int] = None
     missing_keywords: list[str] = []
     repair_passes_used: int = 0
     fixes_applied: list[str] = []
@@ -246,7 +246,7 @@ class CVOptimizationResult(BaseModel):
     target_ats_score: int = 100
 
 
-def _unique_preserve_order(items: list[str], limit: int | None = None) -> list[str]:
+def _unique_preserve_order(items: list[str], limit: Optional[int] = None) -> list[str]:
     seen = set()
     out = []
     for item in items:
@@ -632,7 +632,7 @@ def _generate_cv_once(
         raise Exception(f"Failed to generate CV: {str(e)}")
 
 
-def _to_int_or_none(value: Any) -> int | None:
+def _to_int_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -1398,7 +1398,7 @@ def export_interview_qa(content):
 
     # Accept headings even if wrapped in ** or ##
     heading_re = re.compile(
-        r'^\s*(?:\*{0,3}|#{0,3})\s*(Behavioral Questions|Technical Questions)\s*:?\s*(?:\*{0,3})?\s*$',
+        r'^\s*(?:\*{0,3}|#{0,3})\s*(Behavioral Questions|Technical Questions|Resume-based Questions|General Questions)\s*:?\s*(?:\*{0,3})?\s*$',
         re.IGNORECASE
     )
 

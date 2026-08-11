@@ -59,6 +59,14 @@ from voucher_engine import (
     revoke_voucher as admin_revoke_voucher,
     DEFAULT_PLAN as VOUCHER_DEFAULT_PLAN,
 )
+import coupon_engine
+from coupon_engine import (
+    generate_coupon,
+    redeem_coupon,
+    revoke_coupon as admin_revoke_coupon,
+    list_coupons as list_all_coupons,
+    list_coupon_redemptions as list_all_coupon_redemptions,
+)
 from credit_engine import (
     wallet_balance,
     spend_credits,
@@ -566,6 +574,18 @@ def main():
             st.rerun()
         return
 
+    # Admin-only Admin Panel (coupons + vouchers + redemptions + user lookup)
+    if st.session_state.get("page") == "admin":
+        if not is_voucher_admin(current_user.get("email", "")):
+            st.error("You don't have access to this page.")
+            return
+        st.markdown("## 🛠️ Admin Panel")
+        show_admin_panel(current_user.get("email", ""))
+        if st.button("⬅ Back"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
     # Sidebar
     with st.sidebar:
         st.markdown(
@@ -647,10 +667,10 @@ def main():
             st.session_state.page = "billing"
             st.rerun()
 
-        # Admin-only: Voucher management
+        # Admin-only: Admin Panel (coupons + vouchers + audit + user lookup)
         if is_voucher_admin(current_user.get("email", "")):
-            if st.sidebar.button("🎫 Admin · Vouchers"):
-                st.session_state.page = "admin_vouchers"
+            if st.sidebar.button("🛠️ Admin Panel"):
+                st.session_state.page = "admin"
                 st.rerun()
 
 
@@ -2426,6 +2446,281 @@ def show_admin_vouchers_page(admin_email):
     )
 
 
+def _admin_generate_coupon_form(admin_email):
+    """Sub-section: generate a new coupon."""
+    from datetime import datetime as _dt
+    st.markdown("#### ➕ Generate coupon")
+    with st.form("generate_coupon_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            credits = st.number_input(
+                "Credits to grant",
+                min_value=coupon_engine.MIN_CREDITS,
+                max_value=coupon_engine.MAX_CREDITS,
+                value=50, step=1,
+                key="cp_credits",
+            )
+            max_red = st.number_input(
+                "Max redemptions",
+                min_value=1, max_value=1000, value=1, step=1,
+                key="cp_max_red",
+            )
+        with c2:
+            expires_at_input = st.date_input(
+                "Expires on (optional)", value=None, key="cp_expires",
+            )
+            target_email = st.text_input(
+                "Target email (optional)",
+                placeholder="leave blank for any user",
+                key="cp_target_email",
+            )
+        with c3:
+            note = st.text_input(
+                "Note (optional)",
+                placeholder="e.g. Marketing — July cohort",
+                key="cp_note",
+            )
+        submitted = st.form_submit_button("Generate coupon", use_container_width=True)
+
+    if submitted:
+        try:
+            expires_at = (
+                _dt.combine(expires_at_input, _dt.min.time())
+                if expires_at_input else None
+            )
+            target = (target_email or "").strip().lower() or None
+            c = generate_coupon(
+                credits=int(credits),
+                max_redemptions=int(max_red),
+                expires_at=expires_at,
+                target_email=target,
+                created_by=admin_email,
+                note=(note or None),
+            )
+            st.success(
+                f"✅ Created **`{c['code']}`** — {c['credits']} credits, "
+                f"{c['max_redemptions']} redemption(s)."
+            )
+            st.info(
+                "📋 Copy the code above and share it with the user. "
+                "Codes are case-insensitive."
+            )
+            # Show the code in a copy-friendly text box
+            st.code(c["code"], language="text")
+            st.session_state["_last_generated_coupon"] = c["code"]
+        except Exception as e:
+            st.error(f"❌ Could not create coupon: {e}")
+
+
+def _admin_list_coupons():
+    """Sub-section: list, filter, revoke coupons."""
+    st.markdown("#### 📋 Coupons")
+    try:
+        rows = list_all_coupons()
+    except Exception as e:
+        st.error(f"Could not load coupons: {e}")
+        return
+
+    if not rows:
+        st.info("No coupons yet.")
+        return
+
+    # Status / search filters
+    f1, f2 = st.columns([2, 3])
+    with f1:
+        status_filter = st.selectbox(
+            "Filter by status",
+            options=["all", "active", "revoked"],
+            key="cp_status_filter",
+        )
+    with f2:
+        query = st.text_input(
+            "Search (code / note / email)",
+            placeholder="CP-... or note text",
+            key="cp_search",
+        ).strip().lower()
+
+    view = rows
+    if status_filter != "all":
+        view = [r for r in view if r.get("status") == status_filter]
+    if query:
+        view = [
+            r for r in view
+            if query in (r.get("code", "") or "").lower()
+            or query in (r.get("note", "") or "").lower()
+            or query in (r.get("target_email", "") or "").lower()
+            or query in (r.get("created_by", "") or "").lower()
+        ]
+
+    if not view:
+        st.caption("No coupons match the current filter.")
+        return
+
+    for v in view:
+        with st.container(border=True):
+            col_info, col_action = st.columns([5, 1])
+            with col_info:
+                expires = v.get("expires_at")
+                expires_str = expires.strftime("%Y-%m-%d") if expires else "—"
+                created = v.get("created_at")
+                created_str = (
+                    created.strftime("%Y-%m-%d") if created else "—"
+                )
+                target = v.get("target_email") or "any user"
+                st.markdown(
+                    f"**`{v['code']}`** · **{v['credits']} credits** · "
+                    f"**{v['redeemed_count']}/{v['max_redemptions']}** "
+                    f"redemptions · expires {expires_str} · "
+                    f"target: `{target}` · status: `{v['status']}`"
+                )
+                meta = []
+                if v.get("note"):
+                    meta.append(f"📝 {v['note']}")
+                if v.get("created_by"):
+                    meta.append(f"Created by {v['created_by']} on {created_str}")
+                if meta:
+                    st.caption(" · ".join(meta))
+            with col_action:
+                if v["status"] == "active":
+                    if st.button(
+                        "Revoke",
+                        key=f"cp_revoke_{v['code']}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            admin_revoke_coupon(v["code"])
+                            st.success(f"Revoked {v['code']}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+
+def _admin_coupon_redemptions():
+    """Sub-section: combined audit of coupon redemptions + ledger grants."""
+    st.markdown("#### 👥 Coupon redemptions")
+    try:
+        reds = list_all_coupon_redemptions(limit=500)
+    except Exception as e:
+        st.error(f"Could not load coupon redemptions: {e}")
+        return
+
+    if not reds:
+        st.info("No coupon redemptions yet.")
+        return
+
+    codes = sorted({r["coupon_code"] for r in reds})
+    code_filter = st.selectbox(
+        "Filter by code", options=["(all)"] + codes,
+        key="cp_redemptions_filter",
+    )
+    view = (
+        reds
+        if code_filter == "(all)"
+        else [r for r in reds if r["coupon_code"] == code_filter]
+    )
+    st.dataframe(
+        [{
+            "Code": r["coupon_code"],
+            "Email": r["user_email"],
+            "Credits granted": r["credits_granted"],
+            "When": (
+                r["redeemed_at"].strftime("%Y-%m-%d %H:%M")
+                if r.get("redeemed_at") else "—"
+            ),
+        } for r in view],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _admin_user_lookup():
+    """Sub-section: lookup a user's wallet + recent ledger entries."""
+    st.markdown("#### 👤 User lookup")
+    lookup_email = st.text_input(
+        "User email",
+        placeholder="someone@example.com",
+        key="cp_user_lookup_email",
+    ).strip().lower()
+
+    if not lookup_email:
+        st.caption("Enter an email to view their wallet + recent credit activity.")
+        return
+
+    try:
+        from credit_engine import wallet_balance
+        from database import get_db_connection, release_db_connection
+        bal = wallet_balance("individual", lookup_email)
+        st.markdown(
+            f"**Plan:** `{bal.get('plan', 'Free')}`  \n"
+            f"**Subscription credits:** `{bal.get('subscription_credits', 0)}`  \n"
+            f"**Pack credits:** `{bal.get('pack_credits', 0)}`  \n"
+            f"**Total:** `{bal.get('total', 0)}`"
+        )
+    except Exception as e:
+        st.warning(f"Wallet lookup failed: {e}")
+
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT created_at, feature, amount, txn_type, source,
+                       balance_after
+                  FROM credit_transactions
+                 WHERE account_type='individual' AND email=%s
+                 ORDER BY created_at DESC
+                 LIMIT 20
+                """,
+                (lookup_email,),
+            )
+            rows = cur.fetchall()
+        finally:
+            release_db_connection(conn)
+        if rows:
+            st.markdown("**Recent credit transactions**")
+            st.dataframe(
+                [{
+                    "When": r[0].strftime("%Y-%m-%d %H:%M") if r[0] else "—",
+                    "Feature": r[1] or "",
+                    "Amount": r[2],
+                    "Type": r[3],
+                    "Source": r[4] or "",
+                    "Balance after": r[5],
+                } for r in rows],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No recent credit transactions for this user.")
+    except Exception as e:
+        st.warning(f"Ledger lookup failed: {e}")
+
+
+def show_admin_panel(admin_email):
+    """Admin-only multi-tab page: Coupons / Vouchers / Redemptions / Users."""
+    tab_coupons, tab_vouchers, tab_redemptions, tab_users = st.tabs([
+        "🎟️ Coupons",
+        "🎫 Vouchers",
+        "👥 Redemptions",
+        "👤 Users",
+    ])
+
+    with tab_coupons:
+        _admin_generate_coupon_form(admin_email)
+        st.markdown("---")
+        _admin_list_coupons()
+
+    with tab_vouchers:
+        show_admin_vouchers_page(admin_email)
+
+    with tab_redemptions:
+        _admin_coupon_redemptions()
+
+    with tab_users:
+        _admin_user_lookup()
+
+
 def show_billing_page():
     """Billing and subscription management with Stripe + currency localization"""
 
@@ -2935,47 +3230,91 @@ def show_billing_page():
                 )
                 st.stop()
 
-        # ── Voucher redemption (Voucher Pro — 1 month, no F2F) ───────────────
-        st.markdown("### 🎫 Have a voucher code?")
+        # ── Voucher / Coupon redemption ───────────────────────────────────────
+        # Single input box accepts both CP- (coupons → credits) and CV- (vouchers
+        # → 1-month plan activation). The prefix decides which engine handles it.
+        st.markdown("### 🎟️ Have a code?")
         st.caption(
-            "Selected users get 1 month of full platform access via a voucher code. "
-            "Live voice interview (ElevenLabs) is excluded; everything else is included."
+            "Coupons (CP-XXXX-XXXX) add credits to your wallet. "
+            "Vouchers (CV-XXXX-XXXX) activate 1 month of Voucher Pro."
         )
         v1, v2 = st.columns([3, 1])
         with v1:
-            voucher_input = st.text_input(
-                "Voucher code",
+            code_input = st.text_input(
+                "Code",
                 key="voucher_code_input",
-                placeholder="CV-XXXX-XXXX",
+                placeholder="CP-XXXX-XXXX or CV-XXXX-XXXX",
             )
         with v2:
             redeem_clicked = st.button("Redeem", key="redeem_voucher_btn")
         voucher_msg = st.empty()
 
-        if redeem_clicked and voucher_input:
-            result = redeem_voucher(voucher_input.strip(), user_email)
-            if result.get("ok"):
-                voucher_msg.success(
-                    f"✅ Voucher redeemed! {result['plan']} activated for "
-                    f"{result['duration_days']} days ({result['credits']} credits)."
-                )
-                try:
-                    reset_credits_if_expired(user_email)
-                except Exception:
-                    pass
-                st.rerun()
+        COUPON_FRIENDLY = {
+            "not_found": "This code doesn't exist. Please double-check.",
+            "inactive": "This code has been revoked.",
+            "expired": "This code has expired.",
+            "max_redemptions": "This code has reached its redemption limit.",
+            "already_redeemed": "You've already redeemed this code.",
+            "wrong_recipient": "This code is reserved for a different user.",
+            "missing_code_or_email": "Please enter a code.",
+            "grant_failed": "The credit grant failed. Please contact support.",
+        }
+        VOUCHER_FRIENDLY = {
+            "not_found": "This code doesn't exist. Please double-check.",
+            "inactive": "This voucher has been revoked.",
+            "expired": "This voucher has expired.",
+            "max_redemptions": "This voucher has reached its redemption limit.",
+            "already_redeemed": "You've already redeemed this code.",
+            "missing_code_or_email": "Please enter a code.",
+            "plan_activation_failed": "Could not activate the plan. Please contact support.",
+        }
+
+        if redeem_clicked and code_input:
+            raw = code_input.strip()
+            account_type = (
+                "business"
+                if st.session_state.get("business_logged_in")
+                else "individual"
+            )
+
+            if raw.upper().startswith("CP-"):
+                result = redeem_coupon(raw, user_email, account_type=account_type)
+                if result.get("ok"):
+                    dup = result.get("duplicate", False)
+                    voucher_msg.success(
+                        f"🎉 Coupon redeemed! +{result['credits']} credits added. "
+                        f"New balance: {result['balance_after']}."
+                        + (" (already credited earlier)" if dup else "")
+                    )
+                    st.rerun()
+                else:
+                    reason = result.get("reason", "unknown")
+                    voucher_msg.error(
+                        f"❌ {COUPON_FRIENDLY.get(reason, f'Could not redeem (reason: {reason}).')}"
+                    )
+
+            elif raw.upper().startswith("CV-"):
+                result = redeem_voucher(raw, user_email)
+                if result.get("ok"):
+                    voucher_msg.success(
+                        f"✅ Voucher redeemed! {result['plan']} activated for "
+                        f"{result['duration_days']} days ({result['credits']} credits)."
+                    )
+                    try:
+                        reset_credits_if_expired(user_email)
+                    except Exception:
+                        pass
+                    st.rerun()
+                else:
+                    reason = result.get("reason", "unknown")
+                    voucher_msg.error(
+                        f"❌ {VOUCHER_FRIENDLY.get(reason, f'Could not redeem (reason: {reason}).')}"
+                    )
+
             else:
-                reason = result.get("reason", "unknown")
-                friendly = {
-                    "not_found": "This code doesn't exist. Please double-check.",
-                    "inactive": "This voucher has been revoked.",
-                    "expired": "This voucher has expired.",
-                    "max_redemptions": "This voucher has reached its redemption limit.",
-                    "already_redeemed": "You've already redeemed this code.",
-                    "missing_code_or_email": "Please enter a code.",
-                    "plan_activation_failed": "Could not activate the plan. Please contact support.",
-                }.get(reason, f"Could not redeem (reason: {reason}).")
-                voucher_msg.error(f"❌ {friendly}")
+                voucher_msg.error(
+                    "❌ Codes start with CP- (coupon credits) or CV- (voucher plan)."
+                )
 
         for plan_name, cfg in pricing.PLANS.items():
             # Voucher-only plans aren't user-buyable — activated via redemption above.

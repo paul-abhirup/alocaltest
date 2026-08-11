@@ -81,29 +81,28 @@ def _generate_search_variants_cached(query_title: str) -> tuple[str, ...]:
             
     except Exception as e:
         print(f"Error calling Gemini for query expansion: {e}")
-        # Fallback to the old logic
-        norm = normalize_title(query_title)
-        variants = [query_title.strip(), norm]
-        
-        low = norm.lower()
-        
-        # Dev / Engineer variations
-        if "developer" in low:
-            variants.append(re.sub(r"\bdeveloper\b", "Engineer", norm, flags=re.IGNORECASE))
-            variants.append(re.sub(r"\bdeveloper\b", "Software Engineer", norm, flags=re.IGNORECASE))
-        elif "engineer" in low:
-            variants.append(re.sub(r"\bengineer\b", "Developer", norm, flags=re.IGNORECASE))
-            variants.append(re.sub(r"\bsoftware engineer\b", "Developer", norm, flags=re.IGNORECASE))
-    
-        # Tech-specific role aliases
-        if "python" in low:
-            variants.extend(["Python Developer", "Python Engineer", "Backend Python Engineer", "Software Engineer Python"])
-        elif "react" in low:
-            variants.extend(["React Developer", "React Engineer", "Frontend React Developer"])
-        elif "node" in low:
-            variants.extend(["Node.js Developer", "Node Developer", "Backend Node Engineer"])
-        elif "java" in low and "javascript" not in low:
-            variants.extend(["Java Developer", "Java Software Engineer", "Backend Java Engineer"])
+        variants = [query_title.strip()]
+
+    # Standard deterministic variations
+    norm = normalize_title(query_title)
+    if norm not in variants:
+        variants.append(norm)
+    low = norm.lower()
+    if "developer" in low:
+        variants.append(re.sub(r"\bdeveloper\b", "Engineer", norm, flags=re.IGNORECASE))
+        variants.append(re.sub(r"\bdeveloper\b", "Software Engineer", norm, flags=re.IGNORECASE))
+    elif "engineer" in low:
+        variants.append(re.sub(r"\bengineer\b", "Developer", norm, flags=re.IGNORECASE))
+        variants.append(re.sub(r"\bsoftware engineer\b", "Developer", norm, flags=re.IGNORECASE))
+
+    if "python" in low:
+        variants.extend(["Python Developer", "Python Engineer", "Backend Python Engineer", "Software Engineer Python"])
+    elif "react" in low:
+        variants.extend(["React Developer", "React Engineer", "Frontend React Developer"])
+    elif "node" in low:
+        variants.extend(["Node.js Developer", "Node Developer", "Backend Node Engineer"])
+    elif "java" in low and "javascript" not in low:
+        variants.extend(["Java Developer", "Java Software Engineer", "Backend Java Engineer"])
 
     # Deduplicate preserving order
     seen = set()

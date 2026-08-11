@@ -719,6 +719,108 @@ def increment_free_usage(account_type, email, feature):
 
 
 # ---------------------------------------------------------------------------
+# Grants (admin / coupon / promo credits)
+# ---------------------------------------------------------------------------
+def grant_credits(
+    account_type,
+    email,
+    amount,
+    *,
+    feature,
+    source="gift",
+    reference_code=None,
+    idempotency_key=None,
+):
+    """Atomically add `amount` credits to `pack_credits` (no expiry) and
+    write a ledger row with `txn_type='credit'`, `source='gift'`.
+
+    Args:
+        account_type: "individual" or "business".
+        email: Recipient.
+        amount: Positive integer to grant.
+        feature: Short label for the ledger (e.g. "Coupon: CP-XXXX-XXXX").
+        source: Defaults to "gift". One of "gift" | "promo" | "admin".
+        reference_code: Optional coupon / promo code to attach to the ledger.
+        idempotency_key: When set, a second call with the same key returns
+            {"ok": True, "duplicate": True, "balance_after": <unchanged>}
+            instead of granting again. Recommended for coupon redemptions.
+
+    Returns:
+        {"ok": True, "balance_after": int, "granted": int}
+        {"ok": True, "balance_after": int, "granted": 0, "duplicate": True}
+        {"ok": False, "reason": "invalid_amount"|"db_error"}
+    """
+    import psycopg2
+
+    amount = int(amount or 0)
+    if amount <= 0:
+        return {"ok": False, "reason": "invalid_amount"}
+    email = (email or "").strip().lower()
+
+    conn = get_db_connection()
+    try:
+        with conn:
+            cur = conn.cursor()
+            wallet_id = _ensure_wallet(cur, account_type, email)
+            cur.execute(
+                """
+                UPDATE credit_wallets
+                   SET pack_credits = pack_credits + %s,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = %s
+                RETURNING pack_credits
+                """,
+                (amount, wallet_id),
+            )
+            new_pack = int(cur.fetchone()[0])
+
+            feature_label = (
+                f"{feature}" + (f" ({reference_code})" if reference_code else "")
+            )
+
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO credit_transactions
+                        (account_type, email, feature, amount, txn_type,
+                         source, balance_after, request_id, idempotency_key, group_id)
+                    VALUES (%s, %s, %s, %s, 'credit', %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        account_type,
+                        email,
+                        feature_label,
+                        amount,
+                        source,
+                        new_pack,
+                        str(uuid.uuid4()),
+                        idempotency_key,
+                        reference_code,
+                    ),
+                )
+            except psycopg2.errors.UniqueViolation:
+                # Idempotency-key collision — a previous grant succeeded. Read
+                # the current pack_credits and return without double-granting.
+                conn.rollback()
+                cur2 = conn.cursor()
+                cur2.execute(
+                    "SELECT pack_credits FROM credit_wallets WHERE id=%s",
+                    (wallet_id,),
+                )
+                cur_pack = int(cur2.fetchone()[0])
+                cur2.close()
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "granted": 0,
+                    "balance_after": cur_pack,
+                }
+    finally:
+        release_db_connection(conn)
+    return {"ok": True, "granted": amount, "balance_after": new_pack}
+
+
+# ---------------------------------------------------------------------------
 # Purchases
 # ---------------------------------------------------------------------------
 def purchase_plan(account_type, email, plan_name, stripe_session_id=None, duration_days=None):

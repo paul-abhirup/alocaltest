@@ -632,6 +632,43 @@ def _init_db_once():
         CREATE INDEX IF NOT EXISTS idx_voucher_red_user ON voucher_redemptions(user_email)
     """)
 
+    # Coupon codes (admin-generated) — grant N wallet credits when redeemed.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS coupons (
+            code VARCHAR(32) PRIMARY KEY,
+            credits INTEGER NOT NULL CHECK (credits > 0),
+            max_redemptions INTEGER NOT NULL DEFAULT 1,
+            redeemed_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMP,
+            target_email VARCHAR(255),
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            created_by VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            note TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_coupons_status ON coupons(status)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_coupons_target ON coupons(target_email)
+            WHERE target_email IS NOT NULL
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS coupon_redemptions (
+            id SERIAL PRIMARY KEY,
+            coupon_code VARCHAR(32) NOT NULL REFERENCES coupons(code) ON DELETE CASCADE,
+            user_email VARCHAR(255) NOT NULL REFERENCES users(email) ON DELETE CASCADE,
+            credits_granted INTEGER NOT NULL,
+            redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (coupon_code, user_email)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_coupon_red_user ON coupon_redemptions(user_email)
+    """)
+
 
 
     
@@ -892,6 +929,155 @@ def list_voucher_redemptions(code=None, email=None, limit=50):
             cursor.execute(
                 """
                 SELECT * FROM voucher_redemptions
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (int(limit),),
+            )
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Coupon helpers (admin-generated credit grants)
+# ---------------------------------------------------------------------------
+def create_coupon(code, credits, max_redemptions, expires_at,
+                  target_email, created_by, note):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO coupons (code, credits, max_redemptions, expires_at,
+                                 target_email, created_by, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING code
+            """,
+            (code, int(credits), int(max_redemptions), expires_at,
+             target_email, created_by, note),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+    return code
+
+
+def get_coupon(code):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT * FROM coupons WHERE code=%s", (code,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def list_coupons():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT * FROM coupons ORDER BY created_at DESC")
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def revoke_coupon(code):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE coupons SET status='revoked' WHERE code=%s", (code,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def redeem_coupon_atomic(code, email):
+    """Atomically reserve a coupon redemption.
+
+    Locks the coupon row, checks the cap, ensures the user has not already
+    redeemed it (and matches target_email if set), increments redeemed_count,
+    inserts the redemption row, and returns the coupon dict. The caller
+    grants credits separately so any failure during grant_credits rolls back
+    cleanly via the surrounding transaction.
+
+    Returns the coupon dict on success, or {"error": reason} on rejection.
+    """
+    email = (email or "").strip().lower()
+    conn = get_db_connection()
+    try:
+        with conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("SELECT * FROM coupons WHERE code=%s FOR UPDATE", (code,))
+            c = cur.fetchone()
+            if not c:
+                return {"error": "not_found"}
+            c = dict(c)
+            if c["status"] != "active":
+                return {"error": "inactive"}
+            if c["expires_at"] is not None and c["expires_at"] <= datetime.now():
+                return {"error": "expired"}
+            if c["redeemed_count"] >= c["max_redemptions"]:
+                return {"error": "max_redemptions"}
+            if c["target_email"] and c["target_email"].strip().lower() != email:
+                return {"error": "wrong_recipient"}
+            cur.execute(
+                "SELECT 1 FROM coupon_redemptions WHERE coupon_code=%s AND user_email=%s",
+                (code, email),
+            )
+            if cur.fetchone():
+                return {"error": "already_redeemed"}
+            cur.execute(
+                """
+                UPDATE coupons SET redeemed_count = redeemed_count + 1
+                 WHERE code=%s
+                """,
+                (code,),
+            )
+            cur.execute(
+                """
+                INSERT INTO coupon_redemptions (coupon_code, user_email, credits_granted)
+                VALUES (%s, %s, %s)
+                """,
+                (code, email, int(c["credits"])),
+            )
+            return c
+    finally:
+        release_db_connection(conn)
+
+
+def list_coupon_redemptions(code=None, email=None, limit=200):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if code:
+            cursor.execute(
+                """
+                SELECT * FROM coupon_redemptions
+                 WHERE coupon_code=%s
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (code, int(limit)),
+            )
+        elif email:
+            cursor.execute(
+                """
+                SELECT * FROM coupon_redemptions
+                 WHERE user_email=%s
+                 ORDER BY redeemed_at DESC LIMIT %s
+                """,
+                (email, int(limit)),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM coupon_redemptions
                  ORDER BY redeemed_at DESC LIMIT %s
                 """,
                 (int(limit),),

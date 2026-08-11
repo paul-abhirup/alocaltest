@@ -1932,9 +1932,9 @@ def _qa_bank_to_text(bank: dict) -> str:
     idx = 1
     section_titles = {
         "general": "General Questions",
-        "technical": "Technical Questions",
-        "behavioral": "Behavioral Questions",
-        "resume": "Resume-based Questions",
+        "technical": "Technical Questions (JD-based)",
+        "behavioral": "Behavioral / Situational Questions",
+        "resume": "Resume-Based Questions",
     }
     for section in bank.keys():
         section_title = section_titles.get(section, section.title())
@@ -1942,7 +1942,14 @@ def _qa_bank_to_text(bank: dict) -> str:
         qs = bank.get(section, [])
         for q in qs:
             lines.append(f"{idx}. {q.get('question', '')}")
-            lines.append(f"Answer: {q.get('ideal_answer', '')}")
+            answer = q.get("ideal_answer", "")
+            star = _split_star(answer)
+            if star:
+                lines.append("Suggested answer (STAR method):")
+                for label in _STAR_LABELS:
+                    lines.append(f"{label}: {star[label]}")
+            else:
+                lines.append(f"Suggested answer: {answer}")
             lines.append("")
             idx += 1
     return "\n".join(lines)

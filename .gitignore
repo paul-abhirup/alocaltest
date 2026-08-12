@@ -9,7 +9,6 @@ docs/**/secrets*
 docs/
 
 resume/
-scripts/
 
 # Python
 .venv/

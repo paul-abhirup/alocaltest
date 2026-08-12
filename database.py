@@ -32,17 +32,48 @@ def _init_connection_pool():
         if _connection_pool is not None:
             return _connection_pool
         
-        db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL")
-        if db_url:
-            if db_url.startswith("postgres://"):
-                db_url = db_url.replace("postgres://", "postgresql://", 1)
-            _connection_pool = pool.ThreadedConnectionPool(
-                minconn=2,
-                maxconn=20,
-                dsn=db_url,
-                connect_timeout=10,
-                application_name="cvolvepro"
-            )
+        try:
+            db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL")
+            if db_url:
+                if db_url.startswith("postgres://"):
+                    db_url = db_url.replace("postgres://", "postgresql://", 1)
+                _connection_pool = pool.ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=20,
+                    dsn=db_url,
+                    connect_timeout=10,
+                    application_name="cvolvepro"
+                )
+            else:
+                host = get_secret("DB_HOST", "127.0.0.1")
+                port = int(get_secret("DB_PORT", "5432"))
+                database = get_secret("DB_NAME", get_secret("DB_DATABASE", "cvolvepro"))
+                user = get_secret("DB_USER", get_secret("DB_USERNAME", "postgres"))
+                password = get_secret("DB_PASSWORD", "")
+                sslmode = get_secret("DB_SSLMODE", None)
+
+                conn_kwargs = {
+                    "host": host,
+                    "port": port,
+                    "database": database,
+                    "user": user,
+                    "password": password,
+                    "connect_timeout": 10,
+                    "application_name": "cvolvepro"
+                }
+                if sslmode:
+                    conn_kwargs["sslmode"] = sslmode
+                elif host not in ("127.0.0.1", "localhost"):
+                    conn_kwargs["sslmode"] = "require"
+
+                _connection_pool = pool.ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=20,
+                    **conn_kwargs
+                )
+        except Exception as e:
+            logger.warning("Could not initialize connection pool: %s", e)
+            _connection_pool = None
         return _connection_pool
 
 def release_db_connection(conn):
@@ -228,6 +259,21 @@ def _init_db_once():
     conn.rollback()  # clear any stale transaction state from a pooled connection
     cursor = conn.cursor()
 
+    def safe_exec(sql: str, params=None):
+        try:
+            cursor.execute("SAVEPOINT ddl_sp")
+            if params:
+                cursor.execute(sql, params)
+            else:
+                cursor.execute(sql)
+            cursor.execute("RELEASE SAVEPOINT ddl_sp")
+        except psycopg2.errors.InsufficientPrivilege as e:
+            cursor.execute("ROLLBACK TO SAVEPOINT ddl_sp")
+            logger.warning("Skipped DDL statement due to table ownership or privilege restriction: %s", e)
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT ddl_sp")
+            raise
+
     # Bound how long DDL waits for a conflicting runtime lock, then retry
     # (init_db) instead of letting the server raise a deadlock.
     try:
@@ -242,7 +288,7 @@ def _init_db_once():
     # BUSINESS USERS TABLE
     # =========================================================
 
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS business_users (
             id SERIAL PRIMARY KEY,
 
@@ -266,11 +312,11 @@ def _init_db_once():
         )
     """)
     # Active business plan tracking (may predate this migration on prod)
-    cursor.execute("""
+    safe_exec("""
         ALTER TABLE business_users
         ADD COLUMN IF NOT EXISTS current_plan VARCHAR(100)
     """)
-    cursor.execute("""
+    safe_exec("""
         ALTER TABLE business_users
         ADD COLUMN IF NOT EXISTS plan_expiry TIMESTAMP
     """)
@@ -279,7 +325,7 @@ def _init_db_once():
     # BUSINESS SUBSCRIPTIONS
     # =========================================================
 
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS business_subscriptions (
             id SERIAL PRIMARY KEY,
 
@@ -303,7 +349,7 @@ def _init_db_once():
     # BUSINESS CREDIT USAGE
     # =========================================================
 
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS business_credit_usage (
             id SERIAL PRIMARY KEY,
 
@@ -318,7 +364,7 @@ def _init_db_once():
     """)
     
     # Users table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         name VARCHAR(100) NOT NULL,
@@ -339,7 +385,7 @@ def _init_db_once():
     """)
     
     # Subscriptions table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -353,7 +399,7 @@ def _init_db_once():
     """)
     
     # CV generations table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS cv_generations (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -369,7 +415,7 @@ def _init_db_once():
     """)
     
     # User sessions table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS user_sessions (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -379,10 +425,10 @@ def _init_db_once():
         )
     """)
     # Needed so ON CONFLICT (user_email) works in save_user_session
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_sessions_email ON user_sessions(user_email)")    
+    safe_exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_sessions_email ON user_sessions(user_email)")    
     
     # Payments table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -395,13 +441,13 @@ def _init_db_once():
         )
     """)
     # Enforce idempotency when a Stripe ID exists (allow multiple NULLs)
-    cursor.execute("""
+    safe_exec("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_stripe_id
         ON payments(stripe_payment_id) WHERE stripe_payment_id IS NOT NULL
     """)
     
     # Discount codes table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS discount_codes (
             id SERIAL PRIMARY KEY,
             code VARCHAR(50) UNIQUE NOT NULL,
@@ -413,7 +459,7 @@ def _init_db_once():
         )
     """)
 
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS user_special_discounts (
             id SERIAL PRIMARY KEY,
 
@@ -434,7 +480,7 @@ def _init_db_once():
     """)
 
     # user coupon usage table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS user_coupon_usage (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -444,7 +490,7 @@ def _init_db_once():
     """)
 
     # Credit usage table
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS credit_usage (
             id SERIAL PRIMARY KEY,
             user_email VARCHAR(255) REFERENCES users(email),
@@ -455,7 +501,7 @@ def _init_db_once():
     """)
 
     # Monthly credit cycle anchor (starts when a plan is purchased)
-    cursor.execute("""
+    safe_exec("""
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS credit_cycle_start TIMESTAMP
     """)
@@ -465,7 +511,7 @@ def _init_db_once():
     # =========================================================
 
     # Wallet = single source of truth for credit balances per account.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS credit_wallets (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',  -- individual | business
@@ -482,7 +528,7 @@ def _init_db_once():
     """)
 
     # Immutable ledger of every credit movement.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS credit_transactions (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
@@ -501,26 +547,26 @@ def _init_db_once():
         )
     """)
     # Newer column added after initial migration (safe on fresh + existing DBs).
-    cursor.execute("ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS group_id VARCHAR(64)")
-    cursor.execute("""
+    safe_exec("ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS group_id VARCHAR(64)")
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS ix_credit_tx_group
         ON credit_transactions(group_id) WHERE group_id IS NOT NULL
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_tx_request
         ON credit_transactions(request_id) WHERE request_id IS NOT NULL
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_credit_tx_idem
         ON credit_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS ix_credit_tx_account
         ON credit_transactions(account_type, email, created_at DESC)
     """)
 
     # Individual purchased credit packs (90-day validity).
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS credit_packs (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
@@ -535,7 +581,7 @@ def _init_db_once():
     """)
 
     # ATS hash-pair history → free rechecks for an identical CV+JD pair.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS ats_checks (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
@@ -548,7 +594,7 @@ def _init_db_once():
     """)
 
     # Free-plan usage counters (reset monthly).
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS free_usage_counters (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
@@ -561,7 +607,7 @@ def _init_db_once():
     """)
 
     # Live F2F mock-interview sessions (incremental block billing).
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS f2f_sessions (
             id SERIAL PRIMARY KEY,
             account_type VARCHAR(20) NOT NULL DEFAULT 'individual',
@@ -581,7 +627,7 @@ def _init_db_once():
     # browser cookie; only its sha256 hash is stored here. Expired rows are
     # purged lazily at app startup. user_email is intentionally NOT a foreign key:
     # business accounts live in business_users, not users.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS auth_sessions (
             token_hash VARCHAR(64) PRIMARY KEY,
             user_email VARCHAR(255) NOT NULL,
@@ -591,18 +637,18 @@ def _init_db_once():
         )
     """)
     # Migration: drop the users FK on databases created before business support.
-    cursor.execute("""
+    safe_exec("""
         ALTER TABLE auth_sessions DROP CONSTRAINT IF EXISTS auth_sessions_user_email_fkey
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_email ON auth_sessions(user_email)
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)
     """)
 
     # Voucher codes (admin-generated) and their redemption history.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS vouchers (
             code VARCHAR(32) PRIMARY KEY,
             plan VARCHAR(50) NOT NULL DEFAULT 'Voucher Pro',
@@ -616,10 +662,10 @@ def _init_db_once():
             note TEXT
         )
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status)
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS voucher_redemptions (
             id SERIAL PRIMARY KEY,
             voucher_code VARCHAR(32) NOT NULL REFERENCES vouchers(code) ON DELETE CASCADE,
@@ -628,12 +674,12 @@ def _init_db_once():
             UNIQUE (voucher_code, user_email)
         )
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_voucher_red_user ON voucher_redemptions(user_email)
     """)
 
     # Coupon codes (admin-generated) — grant N wallet credits when redeemed.
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS coupons (
             code VARCHAR(32) PRIMARY KEY,
             credits INTEGER NOT NULL CHECK (credits > 0),
@@ -647,15 +693,15 @@ def _init_db_once():
             note TEXT
         )
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_coupons_status ON coupons(status)
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_coupons_target ON coupons(target_email)
             WHERE target_email IS NOT NULL
     """)
 
-    cursor.execute("""
+    safe_exec("""
         CREATE TABLE IF NOT EXISTS coupon_redemptions (
             id SERIAL PRIMARY KEY,
             coupon_code VARCHAR(32) NOT NULL REFERENCES coupons(code) ON DELETE CASCADE,
@@ -665,7 +711,7 @@ def _init_db_once():
             UNIQUE (coupon_code, user_email)
         )
     """)
-    cursor.execute("""
+    safe_exec("""
         CREATE INDEX IF NOT EXISTS idx_coupon_red_user ON coupon_redemptions(user_email)
     """)
 

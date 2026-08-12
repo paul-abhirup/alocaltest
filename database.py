@@ -76,13 +76,51 @@ def _init_connection_pool():
             _connection_pool = None
         return _connection_pool
 
+class PooledConnectionWrapper:
+    """Wrapper around psycopg2 pooled connection to ensure conn.close() returns it to pool."""
+    def __init__(self, conn):
+        self._raw_conn = conn
+        self._released = False
+
+    def close(self):
+        if not self._released:
+            self._released = True
+            release_db_connection(self._raw_conn)
+
+    def cursor(self, *args, **kwargs):
+        return self._raw_conn.cursor(*args, **kwargs)
+
+    def commit(self):
+        return self._raw_conn.commit()
+
+    def rollback(self):
+        return self._raw_conn.rollback()
+
+    def __enter__(self):
+        return self._raw_conn.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._raw_conn.__exit__(exc_type, exc_val, exc_tb)
+
+    def __getattr__(self, name):
+        return getattr(self._raw_conn, name)
+
+_released_conns = set()
+_released_lock = threading.Lock()
+
 def release_db_connection(conn, close=False):
     """Return connection to pool safely."""
     if not conn:
         return
-    if getattr(conn, "_released_to_pool", False):
+    if isinstance(conn, PooledConnectionWrapper):
+        conn.close()
         return
-    setattr(conn, "_released_to_pool", True)
+
+    conn_id = id(conn)
+    with _released_lock:
+        if conn_id in _released_conns:
+            return
+        _released_conns.add(conn_id)
 
     pool_obj = _init_connection_pool()
     if pool_obj:
@@ -92,18 +130,12 @@ def release_db_connection(conn, close=False):
         except Exception as e:
             logger.debug("Error returning connection to pool: %s", e)
             try:
-                if hasattr(conn, "_raw_close"):
-                    conn._raw_close()
-                else:
-                    conn.close()
+                conn.close()
             except Exception:
                 pass
     else:
         try:
-            if hasattr(conn, "_raw_close"):
-                conn._raw_close()
-            else:
-                conn.close()
+            conn.close()
         except Exception:
             pass
 
@@ -242,13 +274,9 @@ def get_db_connection():
     pool_obj = _init_connection_pool()
     if pool_obj:
         conn = pool_obj.getconn()
-        setattr(conn, "_released_to_pool", False)
-        if not hasattr(conn, "_raw_close"):
-            conn._raw_close = conn.close
-            def _auto_release_close():
-                release_db_connection(conn)
-            conn.close = _auto_release_close
-        return conn
+        with _released_lock:
+            _released_conns.discard(id(conn))
+        return PooledConnectionWrapper(conn)
     # Fallback to direct connection (should not happen in production)
     db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL") or get_secret("DB_URL")
     if db_url:

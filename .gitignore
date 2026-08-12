@@ -7,7 +7,6 @@
 docs/*.pdf
 docs/**/secrets*
 docs/
-scripts/
 
 resume/
 scripts/

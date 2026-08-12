@@ -7,13 +7,16 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
+
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import job_aggregator as ja
 from job_aggregator import (
     Job, SearchQuery, RemotiveAdapter, ArbeitnowAdapter, AdzunaAdapter, JSearchAdapter,
-    SourceAdapter, SourceAuthError, strip_html, infer_seniority,
+    FindworkAdapter, SourceAdapter, SourceAuthError, strip_html, infer_seniority,
     _parse_required_years, _yoe_adjustment, search_jobs, clear_cache,
     REMOTE_WORLDWIDE, REMOTE_UNKNOWN, REMOTE_IN_COUNTRY, ONSITE_HYBRID, CONTRACT,
 )
@@ -73,6 +76,22 @@ JSEARCH_RAW = {
     "job_salary_currency": "$",
     "job_employment_type": "FULLTIME",
     "job_apply_link": "https://example.com/apply/123",
+}
+
+FINDWORK_RAW = {
+    "id": "nyeLl3n",
+    "role": "Agentic Python Engineer",
+    "company_name": "Evaboot",
+    "company_num_employees": None,
+    "employment_type": None,
+    "location": None,
+    "remote": True,
+    "logo": None,
+    "url": "https://findwork.dev/nyeLl3n/agentic-python-engineer-at-evaboot",
+    "text": "<p>We need <strong>Python</strong> &amp; Django. 5+ years experience.</p>",
+    "date_posted": "2026-08-12T10:04:24Z",
+    "keywords": ["python", "seo", "aws"],
+    "source": "Hn",
 }
 
 
@@ -224,6 +243,71 @@ class TestNormalize(unittest.TestCase):
         raw_no_salary = dict(JSEARCH_RAW)
         raw_no_salary.pop("job_min_salary")
         self.assertIsNone(adapter.normalize(raw_no_salary).salary)
+
+    def test_findwork_normalization(self):
+        j = FindworkAdapter().normalize(FINDWORK_RAW)
+        self.assertEqual(j.title, "Agentic Python Engineer")
+        self.assertEqual(j.company, "Evaboot")
+        self.assertEqual(j.location, "Remote")          # null location → "Remote"
+        self.assertEqual(j.source, "findwork")
+        self.assertEqual(j.source_name, "Findwork.dev")
+        self.assertEqual(j.posted_date, "2026-08-12")
+        self.assertEqual(j.url, "https://findwork.dev/nyeLl3n/agentic-python-engineer-at-evaboot")
+        self.assertNotIn("<", j.description)            # HTML stripped
+        self.assertIn("Python", j.description)
+
+    def test_findwork_missing_title(self):
+        self.assertIsNone(FindworkAdapter().normalize({"role": ""}))
+
+    def test_findwork_null_employment_type_is_dash(self):
+        j = FindworkAdapter().normalize(FINDWORK_RAW)
+        self.assertEqual(j.job_type, "—")
+
+    def test_findwork_contract_employment_type(self):
+        raw = dict(FINDWORK_RAW, remote=False, location="Berlin",
+                   employment_type="Contract")
+        j = FindworkAdapter().normalize(raw)
+        self.assertEqual(j.remote_type, CONTRACT)
+        self.assertEqual(j.job_type, "Contract")
+
+
+class TestFindworkAuth(unittest.TestCase):
+    def test_enabled_only_with_key(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(FindworkAdapter().enabled())
+        with mock.patch.dict("os.environ", {"FINDWORK_API_KEY": "k"}, clear=True):
+            self.assertTrue(FindworkAdapter().enabled())
+
+    @mock.patch.dict("os.environ", {"FINDWORK_API_KEY": "bad"}, clear=True)
+    def test_fetch_401_raises_auth_error(self):
+        adapter = FindworkAdapter()
+        resp = mock.Mock()
+        resp.raise_for_status.side_effect = _build_http_error(401)
+        with mock.patch("job_aggregator.requests.request", return_value=resp):
+            with self.assertRaises(SourceAuthError):
+                adapter.fetch(SearchQuery(title="python"))
+
+    @mock.patch.dict("os.environ", {"FINDWORK_API_KEY": "k"}, clear=True)
+    def test_fetch_sends_auth_and_location(self):
+        adapter = FindworkAdapter()
+        captured = {}
+        def fake_request(method, url, headers, params, timeout, **kwargs):
+            captured.update(headers=headers, params=params)
+            resp = mock.Mock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = {"results": [], "count": 0}
+            return resp
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            adapter.fetch(SearchQuery(title="python", location="london"))
+        self.assertEqual(captured["headers"]["Authorization"], "Token k")
+        self.assertEqual(captured["params"]["location"], "london")
+
+
+def _build_http_error(status_code):
+    """Build a real requests.HTTPError carrying the given response status."""
+    resp = requests.Response()
+    resp.status_code = status_code
+    return requests.exceptions.HTTPError(f"HTTP {status_code}", response=resp)
 
 
 class TestOrchestration(unittest.TestCase):

@@ -6,8 +6,11 @@ The Streamlit UI (app.py) imports `search_jobs()`; `api_server.py` can reuse it 
 without a rewrite. Design & test matrix: docs/JOB_AGGREGATOR_PLAN.md.
 
 Sources:
-  Tier A (keyless, always on):  Remotive, Arbeitnow
+  Tier A (keyless, always on):  Remotive, Arbeitnow, The Muse
   Tier B (key-gated):           Adzuna  (ADZUNA_APP_ID + ADZUNA_APP_KEY)
+                                JSearch (JSEARCH_API_KEY)
+                                Jooble   (JOOBLE_API_KEY)
+                                Findwork (FINDWORK_API_KEY)
 """
 from __future__ import annotations
 
@@ -275,13 +278,15 @@ class SourceAdapter:
         raise NotImplementedError
 
     def _request(self, url, *, params=None, method="GET", json_body=None,
-                  max_retries: int = 2) -> dict:
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+                  headers=None, max_retries: int = 2) -> dict:
+        req_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        if headers:
+            req_headers.update(headers)
         last_exc = None
         for attempt in range(max_retries + 1):
             try:
                 resp = requests.request(method, url, params=params, json=json_body,
-                                        headers=headers, timeout=DEFAULT_TIMEOUT)
+                                        headers=req_headers, timeout=DEFAULT_TIMEOUT)
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.HTTPError as e:
@@ -652,32 +657,51 @@ class FindworkAdapter(SourceAdapter):
         return bool(self.api_key)
 
     def fetch(self, query):
-        headers = {"Authorization": f"Token {self.api_key}", "User-Agent": USER_AGENT}
+        headers = {"Authorization": f"Token {self.api_key}"}
         params = {"search": query.title, "sort_by": "relevance"}
         wants = set(query.work_types or [])
         if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
             params["remote"] = "true"
-        resp = requests.get(self.BASE, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return (data.get("results") or [])[: query.limit]
+        if query.location and query.location.strip().lower() not in ("remote", "worldwide", "anywhere"):
+            params["location"] = query.location
+        try:
+            data = self._request(self.BASE, params=params, headers=headers)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code in (401, 403):
+                raise SourceAuthError(f"Findwork auth failed ({code}) — check API key") from e
+            raise
+        return (data.get("results") or [])[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("role") or "").strip()
         if not title:
             return None
         company = (raw.get("company_name") or "").strip()
-        location = (raw.get("location") or "").strip() or "Remote"
+        location = (raw.get("location") or "").strip()
+        employment = (raw.get("employment_type") or "").strip()
         is_remote = bool(raw.get("remote"))
         posted = (raw.get("date_posted") or "")[:10]
         desc = strip_html(raw.get("text") or "")
 
+        loc_low = location.lower()
+        if any(k in loc_low for k in ("worldwide", "anywhere", "global", "emea")):
+            remote_type = REMOTE_WORLDWIDE
+        elif "remote" in loc_low and re.sub(r"[^a-z]+", "", loc_low) != "remote":
+            remote_type = REMOTE_IN_COUNTRY   # geo-bound remote (e.g. "REMOTE (US)")
+        elif is_remote:
+            remote_type = REMOTE_UNKNOWN      # flagged remote, but doesn't state worldwide
+        elif "contract" in employment.lower() or "freelance" in employment.lower():
+            remote_type = CONTRACT
+        else:
+            remote_type = ONSITE_HYBRID
+
         return Job(
             title=title,
             company=company,
-            location=location,
-            remote_type=REMOTE_WORLDWIDE if is_remote else ONSITE_HYBRID,
-            job_type="Full-time",
+            location=location or "Remote",
+            remote_type=remote_type,
+            job_type=employment.replace("_", " ").strip() or "—",
             url=raw.get("url") or "",
             source=self.source,
             source_name=self.source_name,
@@ -1045,7 +1069,7 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
     # Post-classify remote types for jobs where source didn't detect remote keywords.
     # Only touch jobs from sources known to under-report remote, and only when
     # the current classification is ONSITE_HYBRID (meaning no remote signal detected).
-    _SOURCES_NEEDING_REMOTE_CHECK = {"adzuna", "jooble", "themuse", "arbeitnow"}
+    _SOURCES_NEEDING_REMOTE_CHECK = {"adzuna", "jooble", "themuse", "arbeitnow", "findwork"}
     for job in deduped:
         if job.remote_type == ONSITE_HYBRID and job.source in _SOURCES_NEEDING_REMOTE_CHECK:
             guessed = _classify_remote_from_text(job.title, job.description, job.location)

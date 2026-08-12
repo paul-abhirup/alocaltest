@@ -3,7 +3,7 @@ from unittest import mock
 
 import job_aggregator as ja
 from job_aggregator import (
-    JSearchAdapter, RemotiveAdapter, SearchQuery,
+    FindworkAdapter, JSearchAdapter, RemotiveAdapter, SearchQuery,
     REMOTE_WORLDWIDE, REMOTE_IN_COUNTRY, REMOTE_UNKNOWN, ONSITE_HYBRID, CONTRACT,
     is_paywall_url, _resolve_apply_url, resolve_display_urls, _title_variants,
 )
@@ -75,6 +75,32 @@ class TestRemoteLabeling(unittest.TestCase):
         adapter = RemotiveAdapter()
         q = SearchQuery(title="Python Developer", work_types=[ONSITE_HYBRID])
         self.assertEqual(adapter.fetch(q), [])
+
+    def test_findwork_remote_no_location_is_unknown(self):
+        raw = {"role": "Python Developer", "company_name": "Acme",
+               "remote": True, "location": None}
+        self.assertEqual(FindworkAdapter().normalize(raw).remote_type, REMOTE_UNKNOWN)
+
+    def test_findwork_remote_worldwide_location(self):
+        raw = {"role": "Python Developer", "company_name": "Acme",
+               "remote": True, "location": "Worldwide"}
+        self.assertEqual(FindworkAdapter().normalize(raw).remote_type, REMOTE_WORLDWIDE)
+
+    def test_findwork_geo_bound_remote_is_in_country(self):
+        # Live shape: remote flag false but location literally says "REMOTE (US)"
+        raw = {"role": "Founding Backend Engineer", "company_name": "Origamics",
+               "remote": False, "location": "REMOTE (US)"}
+        self.assertEqual(FindworkAdapter().normalize(raw).remote_type, REMOTE_IN_COUNTRY)
+
+    def test_findwork_onsite(self):
+        raw = {"role": "Data Analyst", "company_name": "Acme",
+               "remote": False, "location": "London, UK"}
+        self.assertEqual(FindworkAdapter().normalize(raw).remote_type, ONSITE_HYBRID)
+
+    def test_findwork_contract(self):
+        raw = {"role": "Data Analyst", "company_name": "Acme",
+               "remote": False, "location": "London, UK", "employment_type": "Contract"}
+        self.assertEqual(FindworkAdapter().normalize(raw).remote_type, CONTRACT)
 
 
 class TestLocationFilterRemoteAwareness(unittest.TestCase):

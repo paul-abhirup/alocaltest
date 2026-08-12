@@ -18,6 +18,9 @@ arrive.
 | **Arbeitnow** | `GET https://www.arbeitnow.com/api/job-board-api` | ❌ none | EU + remote | **Tier A (always on)** |
 | **Adzuna** | `GET https://api.adzuna.com/v1/api/jobs/{country}/search/{page}` | ✅ `app_id` + `app_key` (free tier) | Location/onsite, salary data | Tier B (key-gated) |
 | **Jooble** | `POST https://jooble.org/api/{key}` | ✅ free key | Broad aggregator | Tier B (key-gated) |
+| **JSearch** | `GET https://jsearch.p.rapidapi.com/search-v2` | ✅ RapidAPI key | Salary/remote data | Tier B (key-gated) |
+| **The Muse** | `GET https://www.themuse.com/api/public/jobs` | ❌ none | Curated roles, levels | Tier A (always on) |
+| **Findwork** | `GET https://findwork.dev/api/jobs/` | ✅ `FINDWORK_API_KEY` (free token) | Dev jobs (HN/boards), remote flag | Tier B (key-gated) |
 
 **Why tiers matter:** Tier A gives a working aggregator with no credentials — so we can build,
 demo, and start "running locally" immediately. Tier B adapters register themselves only when
@@ -215,7 +218,9 @@ with tab2:
 5. ⬜ `app.py`: add tab + `show_job_aggregator_page()`.  *(needs running app)*
 6. ✅ **Engine verified**: 26 hermetic unit tests (`tests/test_job_aggregator.py`) +
    live end-to-end run — all 3 sources `ok`, scoring/salary/dedupe/sort confirmed.
-7. ✅ Adzuna key added & live-verified (moved from Tier B → active). Jooble pending a key.
+7. ✅ Adzuna key added & live-verified (moved from Tier B → active). Jooble/JSearch/Findwork
+   keys added & live-verified too; engine now runs 7 sources (Remotive, Arbeitnow, The Muse,
+   Adzuna, Jooble, JSearch, Findwork).
 8. ⬜ *(Later, separate)* expose `search_jobs()` via `api_server.py` for the extension.
 
 **Engine (steps 1–3, 6–7) is done and green.** Remaining work (4–5) is the UI + credit

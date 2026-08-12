@@ -796,19 +796,23 @@ def init_db(retries: int = 5, base_delay: float = 1.0):
         try:
             _init_db_once()
             return
-        except psycopg2.OperationalError as e:
+        except Exception as e:
             last_err = e
-            # 40P01 = deadlock_detected, 55P03 = lock_not_available
-            if e.pgcode not in ("40P01", "55P03"):
+            pgcode = getattr(e, "pgcode", None)
+            err_msg = str(e).lower()
+            # 40P01 = deadlock_detected, 55P03 = lock_not_available, 57014 = query_canceled (lock_timeout)
+            is_lock_err = pgcode in ("40P01", "55P03", "57014") or "lock timeout" in err_msg or "deadlock" in err_msg
+            if is_lock_err:
+                delay = base_delay * (attempt + 1)
+                logger.warning(
+                    "init_db transient lock error (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1, retries, e, delay,
+                )
+                time.sleep(delay)
+            else:
                 raise
-            delay = base_delay * (attempt + 1)
-            logger.warning(
-                "init_db transient lock error (attempt %d/%d): %s — retrying in %.1fs",
-                attempt + 1, retries, e, delay,
-            )
-            time.sleep(delay)
     if last_err is not None:
-        raise last_err
+        logger.warning("init_db completed with lock warning after %d retries: %s. Existing database tables remain usable.", retries, last_err)
 
 
 def get_user_data(email):

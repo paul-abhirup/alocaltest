@@ -553,44 +553,11 @@ def main():
         pass
 
 
-    # If user navigated to Billing from sidebar, render only Billing and return
-    if st.session_state.get("page") == "billing":
-        st.markdown("## 💳 Billing")
-        show_billing_page()
-        if st.button("⬅ Back"):
-            st.session_state.page = "home"   # any non-"billing" value works
-            st.rerun()
-        return
-
-    # Admin-only Voucher management page
-    if st.session_state.get("page") == "admin_vouchers":
-        if not is_voucher_admin(current_user.get("email", "")):
-            st.error("You don't have access to this page.")
-            return
-        st.markdown("## 🎫 Admin · Voucher Management")
-        show_admin_vouchers_page(current_user.get("email", ""))
-        if st.button("⬅ Back"):
-            st.session_state.page = "home"
-            st.rerun()
-        return
-
-    # Admin-only Admin Panel (coupons + vouchers + redemptions + user lookup)
-    if st.session_state.get("page") == "admin":
-        if not is_voucher_admin(current_user.get("email", "")):
-            st.error("You don't have access to this page.")
-            return
-        st.markdown("## 🛠️ Admin Panel")
-        show_admin_panel(current_user.get("email", ""))
-        if st.button("⬅ Back"):
-            st.session_state.page = "home"
-            st.rerun()
-        return
-
     # Sidebar
     with st.sidebar:
         st.markdown(
-        f"👋 Welcome, {current_user.get('name', current_user.get('company_name', 'User'))}"
-    )
+            f"👋 Welcome, {current_user.get('name', current_user.get('company_name', 'User'))}"
+        )
         
         # User credits/subscription status
         email = current_user['email'].strip().lower()
@@ -623,59 +590,44 @@ def main():
 
         
         if st.session_state.get("account_type") == "business":
-
             plan_info = get_business_plan_info(email)
-
             if plan_info and plan_info["current_plan"]:
-
-                st.success(
-                    f"🏢 {plan_info['current_plan']} Plan Active"
-                )
-
+                st.success(f"🏢 {plan_info['current_plan']} Plan Active")
                 if plan_info["plan_expiry"]:
-
-                    st.caption(
-                        f"Valid Until: {plan_info['plan_expiry'].strftime('%d %b %Y')}"
-                    )
-
+                    st.caption(f"Valid Until: {plan_info['plan_expiry'].strftime('%d %b %Y')}")
             else:
-
                 st.warning("⏳ No active business plan")
-
         else:
-
             if subscription:
-
                 if subscription['plan'] == "Free":
-
                     st.info("🆓 Free Trial (1 Month)")
-
                 else:
-
-                    st.success(
-                        f"✅ {subscription['plan']} Plan Active"
-                    )
-
+                    st.success(f"✅ {subscription['plan']} Plan Active")
             else:
-
                 st.warning("⏳ No active plan")
 
         # 💎 Credits — ALWAYS visible
         st.info(f"💎 Credits Available: {credits}")
-            
-        if st.button("🔄 Buy More Credits"):
-            st.session_state.page = "billing"
-            st.rerun()
 
-        # Admin-only: Admin Panel (coupons + vouchers + audit + user lookup)
-        if is_voucher_admin(current_user.get("email", "")):
-            if st.sidebar.button("🛠️ Admin Panel"):
-                st.session_state.page = "admin"
+        # Sidebar navigation buttons
+        if st.session_state.get("page") in ("billing", "admin", "admin_vouchers"):
+            if st.sidebar.button("🏠 Main Page (Job Search)", key="sb_btn_home"):
+                st.session_state.page = "home"
+                st.rerun()
+        
+        if st.session_state.get("page") != "billing":
+            if st.sidebar.button("🔄 Buy More Credits", key="sb_btn_billing"):
+                st.session_state.page = "billing"
                 st.rerun()
 
+        # Admin-only: Admin Panel button
+        if is_voucher_admin(current_user.get("email", "")):
+            if st.session_state.get("page") != "admin":
+                if st.sidebar.button("🛠️ Admin Panel", key="sb_btn_admin"):
+                    st.session_state.page = "admin"
+                    st.rerun()
 
-        if st.sidebar.button("Logout"):
-
+        if st.sidebar.button("Logout", key="sb_btn_logout"):
             # Revoke persisted session + clear cookie so refresh stays logged out
             try:
                 cm = _cookie_manager()
@@ -699,10 +651,63 @@ def main():
 
             # Global
             st.session_state.account_type = None
-
+            st.session_state.page = "login"
             st.rerun()
-            
-        
+
+    # If user navigated to Billing from sidebar, render Billing page with Back controls
+    if st.session_state.get("page") == "billing":
+        col_head, col_back = st.columns([3, 1])
+        with col_head:
+            st.markdown("## 💳 Billing & Buy Credits")
+        with col_back:
+            if st.button("🏠 Return to Main Page", key="top_back_billing"):
+                st.session_state.page = "home"
+                st.rerun()
+        show_billing_page()
+        st.markdown("---")
+        if st.button("🏠 Return to Main Page", key="bottom_back_billing"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
+    # Admin-only Voucher management page
+    if st.session_state.get("page") == "admin_vouchers":
+        if not is_voucher_admin(current_user.get("email", "")):
+            st.error("You don't have access to this page.")
+            return
+        col_head, col_back = st.columns([3, 1])
+        with col_head:
+            st.markdown("## 🎫 Admin · Voucher Management")
+        with col_back:
+            if st.button("🏠 Return to Main Page", key="top_back_admin_vouchers"):
+                st.session_state.page = "home"
+                st.rerun()
+        show_admin_vouchers_page(current_user.get("email", ""))
+        st.markdown("---")
+        if st.button("🏠 Return to Main Page", key="bottom_back_admin_vouchers"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
+    # Admin-only Admin Panel (coupons + vouchers + redemptions + user lookup)
+    if st.session_state.get("page") == "admin":
+        if not is_voucher_admin(current_user.get("email", "")):
+            st.error("You don't have access to this page.")
+            return
+        col_head, col_back = st.columns([3, 1])
+        with col_head:
+            st.markdown("## 🛠️ Admin Panel")
+        with col_back:
+            if st.button("🏠 Return to Main Page", key="top_back_admin"):
+                st.session_state.page = "home"
+                st.rerun()
+        show_admin_panel(current_user.get("email", ""))
+        st.markdown("---")
+        if st.button("🏠 Return to Main Page", key="bottom_back_admin"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
         # ✅ Set default template to Professional Classic
         st.session_state.selected_template = "professional"
         

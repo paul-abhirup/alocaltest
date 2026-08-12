@@ -39,7 +39,7 @@ def _init_connection_pool():
                     db_url = db_url.replace("postgres://", "postgresql://", 1)
                 _connection_pool = pool.ThreadedConnectionPool(
                     minconn=2,
-                    maxconn=20,
+                    maxconn=50,
                     dsn=db_url,
                     connect_timeout=10,
                     application_name="cvolvepro"
@@ -68,7 +68,7 @@ def _init_connection_pool():
 
                 _connection_pool = pool.ThreadedConnectionPool(
                     minconn=2,
-                    maxconn=20,
+                    maxconn=50,
                     **conn_kwargs
                 )
         except Exception as e:
@@ -76,11 +76,36 @@ def _init_connection_pool():
             _connection_pool = None
         return _connection_pool
 
-def release_db_connection(conn):
-    """Return connection to pool"""
-    pool = _init_connection_pool()
-    if pool:
-        pool.putconn(conn)
+def release_db_connection(conn, close=False):
+    """Return connection to pool safely."""
+    if not conn:
+        return
+    if getattr(conn, "_released_to_pool", False):
+        return
+    setattr(conn, "_released_to_pool", True)
+
+    pool_obj = _init_connection_pool()
+    if pool_obj:
+        try:
+            is_closed = getattr(conn, "closed", 0) != 0
+            pool_obj.putconn(conn, close=close or is_closed)
+        except Exception as e:
+            logger.debug("Error returning connection to pool: %s", e)
+            try:
+                if hasattr(conn, "_raw_close"):
+                    conn._raw_close()
+                else:
+                    conn.close()
+            except Exception:
+                pass
+    else:
+        try:
+            if hasattr(conn, "_raw_close"):
+                conn._raw_close()
+            else:
+                conn.close()
+        except Exception:
+            pass
 
 def _search_container(container, key: str):
     """Safely search key in dict/AttrDict/Secrets object, case-insensitively."""
@@ -214,9 +239,16 @@ def get_db_config_summary():
 
 def get_db_connection():
     """Get connection from pool"""
-    pool = _init_connection_pool()
-    if pool:
-        return pool.getconn()
+    pool_obj = _init_connection_pool()
+    if pool_obj:
+        conn = pool_obj.getconn()
+        setattr(conn, "_released_to_pool", False)
+        if not hasattr(conn, "_raw_close"):
+            conn._raw_close = conn.close
+            def _auto_release_close():
+                release_db_connection(conn)
+            conn.close = _auto_release_close
+        return conn
     # Fallback to direct connection (should not happen in production)
     db_url = get_secret("DATABASE_URL") or get_secret("POSTGRES_URL") or get_secret("DB_URL")
     if db_url:

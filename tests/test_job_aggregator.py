@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import job_aggregator as ja
 from job_aggregator import (
     Job, SearchQuery, RemotiveAdapter, ArbeitnowAdapter, AdzunaAdapter, JSearchAdapter,
-    FindworkAdapter, SourceAdapter, SourceAuthError, strip_html, infer_seniority,
+    FindworkAdapter, JoobleAdapter, SourceAdapter, SourceAuthError, strip_html, infer_seniority,
     _parse_required_years, _yoe_adjustment, search_jobs, clear_cache,
     REMOTE_WORLDWIDE, REMOTE_UNKNOWN, REMOTE_IN_COUNTRY, ONSITE_HYBRID, CONTRACT,
 )
@@ -308,6 +308,208 @@ def _build_http_error(status_code):
     resp = requests.Response()
     resp.status_code = status_code
     return requests.exceptions.HTTPError(f"HTTP {status_code}", response=resp)
+
+
+def _empty_resp(payload):
+    resp = mock.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = payload
+    return resp
+
+
+class TestFetchVolume(unittest.TestCase):
+    """Volume levers: multi-page fetches and server-side page-size bumps."""
+
+    @mock.patch.dict("os.environ", {"JSEARCH_API_KEY": "k"}, clear=True)
+    def test_jsearch_requests_three_pages(self):
+        adapter = JSearchAdapter()
+        captured = {}
+        def fake_get(url, headers, params, timeout):
+            captured["params"] = params
+            return _empty_resp({"data": {"jobs": []}})
+        with mock.patch("job_aggregator.requests.get", side_effect=fake_get):
+            adapter.fetch(SearchQuery(title="python developer"))
+        self.assertEqual(captured["params"]["num_pages"], "3")
+
+    @mock.patch.dict("os.environ", {"JOOBLE_API_KEY": "k"}, clear=True)
+    def test_jooble_large_page_and_country_fanout(self):
+        adapter = JoobleAdapter()
+        bodies = []
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            bodies.append(json)
+            return _empty_resp({"jobs": []})
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            adapter.fetch(SearchQuery(title="python developer", country="all"))
+        # "" + "United States" + "United Kingdom" fan-out for All Countries
+        self.assertEqual([b["location"] for b in bodies], ["", "United States", "United Kingdom"])
+        self.assertTrue(all(b["ResultOnPage"] == 100 for b in bodies))
+
+    @mock.patch.dict("os.environ", {"FINDWORK_API_KEY": "k"}, clear=True)
+    def test_findwork_follows_next_links(self):
+        adapter = FindworkAdapter()
+        calls = []
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            calls.append((url, params))
+            if len(calls) == 1:
+                payload = {
+                    "results": [{"role": "Python Dev", "company_name": "A",
+                                 "location": "Remote", "remote": True,
+                                 "url": "https://findwork.dev/1"}],
+                    "next": "https://findwork.dev/api/jobs/?page=2&search=python&sort_by=relevance",
+                }
+            else:
+                payload = {"results": [{"role": "Python Dev II", "company_name": "B",
+                                        "location": "Remote", "remote": True,
+                                        "url": "https://findwork.dev/2"}],
+                           "next": None}
+            return _empty_resp(payload)
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            rows = adapter.fetch(SearchQuery(title="python developer"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(calls[1][0],
+                         "https://findwork.dev/api/jobs/?page=2&search=python&sort_by=relevance")
+        self.assertIsNone(calls[1][1])      # next URL already carries its query params
+
+    def test_arbeitnow_matches_distinctive_token_and_paginates(self):
+        adapter = ArbeitnowAdapter()
+        pages = [
+            {"data": [
+                {"title": "Backend Engineer", "company_name": "X", "tags": ["python", "django"],
+                 "location": "Berlin", "remote": False, "url": "https://arbeitnow.com/view/1"},
+                {"title": "Frontend Engineer", "company_name": "Y", "tags": ["react"],
+                 "location": "Munich", "remote": False, "url": "https://arbeitnow.com/view/2"},
+            ], "links": {"next": "?page=2"}},
+            {"data": [
+                {"title": "Python Developer", "company_name": "Z", "tags": ["python"],
+                 "location": "Hamburg", "remote": True, "url": "https://arbeitnow.com/view/3"},
+            ], "links": {}},
+        ]
+        calls = []
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            calls.append(params)
+            return _empty_resp(pages[min(len(calls) - 1, len(pages) - 1)])
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            rows = adapter.fetch(SearchQuery(title="python developer"))
+        # Job 2 (react only) excluded; jobs 1 (python tag) & 3 (python title) kept
+        self.assertEqual({r["url"] for r in rows},
+                         {"https://arbeitnow.com/view/1", "https://arbeitnow.com/view/3"})
+        self.assertEqual(calls[0]["page"], 1)
+        self.assertEqual(calls[1]["page"], 2)
+
+    def test_fetch_source_caps_variants_per_source(self):
+        class CapAdapter(ja.SourceAdapter):
+            source = "cap"
+            source_name = "Cap"
+            max_variants = 1
+            def fetch(self, query):
+                seen.append(query.title)
+                return []
+            def normalize(self, raw):
+                return None
+        seen = []
+        q = SearchQuery(title="python developer")
+        fake_variants = ["python developer", "Python Engineer", "Backend Developer"]
+        with mock.patch("job_aggregator._title_variants", return_value=fake_variants):
+            ja.clear_cache()
+            ja._fetch_source(CapAdapter(), q, ttl=99999, now=time.time())
+        self.assertEqual(seen, ["python developer"])    # capped to the primary variant only
+
+
+class TestResultFastPath(unittest.TestCase):
+    """The result-level cache returns already-scored results without refetch/scoring."""
+
+    def setUp(self):
+        clear_cache()
+
+    def test_repeat_search_skips_scoring_and_returns_same(self):
+        fetched = {"n": 0}
+
+        class CA(ja.SourceAdapter):
+            source = "c"
+            source_name = "C"
+            def enabled(self):
+                return True
+            def fetch(self, query):
+                fetched["n"] += 1
+                return [make_job(title="Python Developer", description="python django")]
+            def normalize(self, raw):
+                return raw
+
+        with mock.patch("job_aggregator.default_adapters", return_value=[CA()]):
+            with mock.patch("job_aggregator.calculate_composite_score") as mock_score:
+                mock_score.return_value = (50, 0.5, ["python"])
+                r1 = ja.search_jobs(SearchQuery(title="python developer"))
+                n1 = fetched["n"]
+                first_scores = mock_score.call_count
+                r2 = ja.search_jobs(SearchQuery(title="python developer"))
+
+        self.assertEqual(r2["counts"], r1["counts"])
+        self.assertEqual(fetched["n"], n1)                      # no re-fetch
+        self.assertEqual(mock_score.call_count, first_scores)   # no re-scoring
+        self.assertIsNot(r1, r2)                                # separate deepcopy returned
+
+    def test_different_resume_does_not_hit_cache(self):
+        class CA(ja.SourceAdapter):
+            source = "c"
+            source_name = "C"
+            def enabled(self):
+                return True
+            def fetch(self, query):
+                return [make_job(title="Python Developer", description="python django")]
+            def normalize(self, raw):
+                return raw
+
+        with mock.patch("job_aggregator.default_adapters", return_value=[CA()]):
+            with mock.patch("job_aggregator.calculate_composite_score",
+                            return_value=(50, 0.5, ["python"])) as mock_score:
+                ja.search_jobs(SearchQuery(title="python developer"),
+                               resume_text="python django expert")
+                first = mock_score.call_count
+                ja.search_jobs(SearchQuery(title="python developer"),
+                               resume_text="different resume entirely")
+        self.assertGreater(mock_score.call_count, first)   # different resume → result cache missed
+
+    def test_clear_cache_clears_result_cache(self):
+        fetched = {"n": 0}
+
+        class CA(ja.SourceAdapter):
+            source = "c"
+            source_name = "C"
+            def enabled(self):
+                return True
+            def fetch(self, query):
+                fetched["n"] += 1
+                return [make_job(title="Python Developer", description="python django")]
+            def normalize(self, raw):
+                return raw
+
+        with mock.patch("job_aggregator.default_adapters", return_value=[CA()]):
+            with mock.patch("job_aggregator.calculate_composite_score",
+                            return_value=(50, 0.5, ["python"])):
+                ja.search_jobs(SearchQuery(title="python developer"))
+                n1 = fetched["n"]
+                clear_cache()
+                ja.search_jobs(SearchQuery(title="python developer"))
+        self.assertGreater(fetched["n"], n1)   # evicted → refetch
+
+    def test_sources_arg_bypasses_fast_path(self):
+        class CA(ja.SourceAdapter):
+            source = "c"
+            source_name = "C"
+            def enabled(self):
+                return True
+            def fetch(self, query):
+                return [make_job(title="Python Developer", description="python django")]
+            def normalize(self, raw):
+                return raw
+
+        a = CA()
+        with mock.patch("job_aggregator.calculate_composite_score") as mock_score:
+            mock_score.return_value = (50, 0.5, ["python"])
+            ja.search_jobs(SearchQuery(title="python developer"), sources=[a])
+            first = mock_score.call_count
+            ja.search_jobs(SearchQuery(title="python developer"), sources=[a])
+            self.assertGreater(mock_score.call_count, first)  # re-scored → fast-path bypassed
 
 
 class TestOrchestration(unittest.TestCase):

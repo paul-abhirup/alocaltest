@@ -221,6 +221,14 @@ with tab2:
 7. ✅ Adzuna key added & live-verified (moved from Tier B → active). Jooble/JSearch/Findwork
    keys added & live-verified too; engine now runs 7 sources (Remotive, Arbeitnow, The Muse,
    Adzuna, Jooble, JSearch, Findwork).
+7a. ✅ **Volume tuning** (2026-08): non-Adzuna sources now fetch more — JSearch `num_pages=3`,
+   Jooble `ResultOnPage=100` + All-Countries location fan-out, Findwork follows `next` links,
+   Adzuna 2 pages/country, Arbeitnow ANY-distinctive-token match + paging, The Muse 4 pages.
+   Per-source `max_variants` caps keep slow fan-outs (Adzuna=1, JSearch=2) responsive; latency
+   stayed ≈ baseline while non-Adzuna shown jobs roughly quadrupled. Accuracy filters untouched.
+7b. ✅ **Result fast-path**: scored/filtered results are cached keyed on query + resume-content
+   hash (never user identity) with the same TTL, so an identical repeat search skips re-fetch,
+   re-scoring and the LLM re-ranker — 30s+ cold → ~10ms warm. Explicit `sources=` calls bypass it.
 8. ⬜ *(Later, separate)* expose `search_jobs()` via `api_server.py` for the extension.
 
 **Engine (steps 1–3, 6–7) is done and green.** Remaining work (4–5) is the UI + credit

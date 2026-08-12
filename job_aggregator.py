@@ -43,12 +43,13 @@ from search_engine.deduplication import deduplicate_jobs
 from search_engine.explainability import generate_explainability
 from search_engine.ranking.scorer import calculate_composite_score
 from search_engine.resume_match import is_resume_job_mismatched
+from search_engine.config import GENERIC_ROLE_NOUNS
 
 logger = logging.getLogger(__name__)
 
 # ----------------------------- Tunables ---------------------------------------
-DEFAULT_TIMEOUT = 8            # seconds per source request
-MAX_RESULTS_PER_SOURCE = 80
+DEFAULT_TIMEOUT = 12           # seconds per source request (multi-page sources need more)
+MAX_RESULTS_PER_SOURCE = 100
 MAX_VARIANTS_PER_SOURCE = 2    # search variants fan-out per source (recall boost)
 MAX_DESC_CHARS = 8000         # cap description length before scoring (perf)
 USER_AGENT = "CVOLVE-PRO-JobAggregator/1.0 (+https://cvolvepro.com)"
@@ -267,6 +268,9 @@ def _yoe_adjustment(user_years: Optional[int], jd_text: str) -> int:
 class SourceAdapter:
     source = ""
     source_name = ""
+    # How many title variants this source searches. Slow / high-fan-out sources
+    # cap this to stay responsive; cheap single-request sources use the default.
+    max_variants = MAX_VARIANTS_PER_SOURCE + 1
 
     def enabled(self) -> bool:
         return True
@@ -317,7 +321,7 @@ class RemotiveAdapter(SourceAdapter):
         if wants and ONSITE_HYBRID in wants and not (wants & _REMOTE_FAMILY):
             return []
         data = self._request(self.BASE, params={"search": query.title, "limit": query.limit})
-        return (data.get("jobs") or [])[: query.limit]
+        return (data.get("jobs") or [])[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("title") or "").strip()
@@ -351,23 +355,40 @@ class ArbeitnowAdapter(SourceAdapter):
     BASE = "https://www.arbeitnow.com/api/job-board-api"
 
     def fetch(self, query):
-        # Arbeitnow has no server-side search param → filter client-side by title/tags.
-        # Match on ALL query tokens (not exact substring) so multi-word queries
-        # ("python developer") still surface relevant jobs.
-        data = self._request(self.BASE)
-        jobs = data.get("data") or []
+        # Arbeitnow has no server-side search param → page the whole board and
+        # filter client-side by title/tags.
+        all_jobs = []
         q = query.title.lower().strip()
-        if q:
-            tokens = [t for t in re.split(r"[\s/,-]+", q) if len(t) > 2]
-            if not tokens:
-                tokens = [q]
-            def hay(j):
-                return (j.get("title", "") + " " + " ".join(j.get("tags", []) or [])).lower()
-            if len(tokens) == 1:
-                jobs = [j for j in jobs if tokens[0] in hay(j)]
-            else:
-                jobs = [j for j in jobs if all(t in hay(j) for t in tokens)]
-        return jobs[: query.limit * 2]
+        tokens = [t for t in re.split(r"[\s/,-]+", q) if len(t) > 2]
+        if not tokens:
+            tokens = [q]
+        # Match on ANY distinctive (non-generic) token — e.g. just "python" from
+        # "python developer" — so jobs whose tags carry the tech still surface.
+        # Generic role nouns ("developer") alone never drive a match.
+        distinctive = [t for t in tokens if t not in GENERIC_ROLE_NOUNS] or tokens
+        for page in range(1, 4):
+            try:
+                data = self._request(self.BASE, params={"page": page})
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                if code in (429, 500, 502, 503, 504):
+                    logger.warning("Arbeitnow rate-limited/overloaded on page %d — keeping page(s) so far", page)
+                    break        # rate-limited mid-pagination: keep what we already fetched
+                raise
+            except Exception as e:
+                logger.warning("Arbeitnow fetch failed page %d: %s", page, e)
+                break
+            jobs = data.get("data") or []
+            if not jobs:
+                break
+            all_jobs.extend(jobs)
+            if not (data.get("links") or {}).get("next"):
+                break
+
+        def hay(j):
+            return (j.get("title", "") + " " + " ".join(j.get("tags", []) or [])).lower()
+        matched = [j for j in all_jobs if any(t in hay(j) for t in distinctive)]
+        return matched[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("title") or "").strip()
@@ -403,6 +424,7 @@ class ArbeitnowAdapter(SourceAdapter):
 class AdzunaAdapter(SourceAdapter):
     source = "adzuna"
     source_name = "Adzuna"
+    max_variants = 1      # multi-country × 2 pages is already expensive; main title only
     BASE = "https://api.adzuna.com/v1/api/jobs"
 
     def __init__(self):
@@ -418,9 +440,9 @@ class AdzunaAdapter(SourceAdapter):
         # "All Countries" queries the top markets instead of just US+GB.
         target_countries = ["us", "gb", "in", "de", "ca", "au"] if country == "all" else [country]
         per_page = min(50, max(20, query.limit // len(target_countries)))
-        # Paginate through 2 pages for a single country; single page when fanning
-        # out across many countries.
-        pages = 2 if len(target_countries) <= 3 else 1
+        # Paginate through 2 pages per country for volume, even when fanning out
+        # across many countries.
+        pages = 2
         all_results = []
         wants = set(query.work_types or [])
         wants_remote = bool(wants & _REMOTE_FAMILY) and ONSITE_HYBRID not in wants
@@ -496,6 +518,7 @@ class AdzunaAdapter(SourceAdapter):
 class JSearchAdapter(SourceAdapter):
     source = "jsearch"
     source_name = "JSearch"
+    max_variants = 2      # each request is slow (8–13s); avoid the 3rd variant
     BASE = "https://jsearch.p.rapidapi.com/search-v2"
 
     def __init__(self):
@@ -519,9 +542,9 @@ class JSearchAdapter(SourceAdapter):
         if query.location:
             q_text += f" in {query.location}"
 
-        # Request 1 page (10 results) per query variant to ensure sub-10s API response time
-        num_pages = "1"
-        params = {"query": q_text, "page": "1", "num_pages": num_pages}
+        # Request 3 pages (30 results) per query variant via a single request so JSearch
+        # volume isn't capped at 10 rows while keeping each request fast enough.
+        params = {"query": q_text, "page": "1", "num_pages": "3"}
         if query.country and query.country.lower() != "all":
             wants = set(query.work_types or [])
             # When only worldwide remote is selected, don't lock by country
@@ -532,7 +555,7 @@ class JSearchAdapter(SourceAdapter):
         if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
             params["remote_jobs_only"] = "true"
         try:
-            resp = requests.get(self.BASE, headers=headers, params=params, timeout=15)
+            resp = requests.get(self.BASE, headers=headers, params=params, timeout=20)
             resp.raise_for_status()
         except Exception as e:
             logger.warning(f"JSearch API fetch failed: {e}")
@@ -616,9 +639,22 @@ class JoobleAdapter(SourceAdapter):
             loc = query.location or ""
         else:
             loc = query.location or (c_name if query.country and query.country.lower() != "all" else "")
-        payload = {"keywords": query.title, "location": loc}
-        data = self._request(url, method="POST", json_body=payload)
-        return (data.get("jobs") or [])[: query.limit]
+        # "All Countries" fans out across the biggest markets — Jooble returns a
+        # far larger, location-sorted pool this way (empty location alone is thin).
+        if query.country and query.country.lower() == "all":
+            buckets = ["", "United States", "United Kingdom"]
+        else:
+            buckets = [loc]
+        results = []
+        for b in buckets:
+            payload = {"keywords": query.title, "location": b, "ResultOnPage": 100}
+            try:
+                data = self._request(url, method="POST", json_body=payload)
+            except Exception as e:
+                logger.warning("Jooble fetch failed (location %r): %s", b, e)
+                continue
+            results.extend(data.get("jobs") or [])
+        return results[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("title") or "").strip()
@@ -664,14 +700,28 @@ class FindworkAdapter(SourceAdapter):
             params["remote"] = "true"
         if query.location and query.location.strip().lower() not in ("remote", "worldwide", "anywhere"):
             params["location"] = query.location
-        try:
-            data = self._request(self.BASE, params=params, headers=headers)
-        except requests.HTTPError as e:
-            code = e.response.status_code if e.response is not None else None
-            if code in (401, 403):
-                raise SourceAuthError(f"Findwork auth failed ({code}) — check API key") from e
-            raise
-        return (data.get("results") or [])[: query.limit * 2]
+        results = []
+        url = self.BASE
+        # Paginate via the API's next-links (100 results/page) for real volume.
+        for _ in range(3):
+            try:
+                data = self._request(url, params=params, headers=headers)
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                if code in (401, 403):
+                    raise SourceAuthError(f"Findwork auth failed ({code}) — check API key") from e
+                if code in (429, 500, 502, 503, 504):
+                    logger.warning("Findwork rate-limited/overloaded on %s — keeping page(s) so far", url)
+                    break        # rate-limited mid-pagination: keep what we already fetched
+                raise
+            else:
+                results.extend(data.get("results") or [])
+                next_url = data.get("next")
+                if not next_url:
+                    break
+                url = next_url           # the next URL already carries its own query params
+                params = None
+        return results[: query.limit * 2]
 
     def normalize(self, raw):
         title = (raw.get("role") or "").strip()
@@ -719,7 +769,7 @@ class TheMuseAdapter(SourceAdapter):
         # Keyless public API. Searches are token-based server-side; page through a
         # couple of pages for volume.
         all_results = []
-        for page in range(1, 3):
+        for page in range(1, 5):
             params = {
                 "search": query.title,
                 "page": str(page),
@@ -789,9 +839,35 @@ def _cache_ttl_seconds() -> int:
         return 1800
 
 
+# Fast-path result cache: full scored/filtered/sorted search results, so an
+# identical repeat search (same query + same resume) skips re-fetch, re-scoring
+# and the LLM re-ranker entirely. Keyed on query + resume content hash (never on
+# user identity), so identical users share a hit but different resumes don't.
+_RESULT_CACHE: dict[str, tuple[float, dict]] = {}
+_RESULT_LOCK = threading.Lock()
+_RESULT_CACHE_MAX = 128   # bound memory (each entry holds full job descriptions)
+
+
+def _result_cache_key(query: SearchQuery, resume_text: Optional[str], target_role: Optional[str]) -> str:
+    raw = "|".join([
+        query.title.strip().lower(),
+        query.location.strip().lower(),
+        query.geography.strip().lower(),
+        query.country.lower(),
+        ",".join(sorted(query.work_types or [])),
+        str(query.years_experience if query.years_experience is not None else ""),
+        str(query.limit),
+        hashlib.sha256((resume_text or "").encode()).hexdigest(),
+        (target_role or "").strip().lower(),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+    with _RESULT_LOCK:
+        _RESULT_CACHE.clear()
 
 
 # ============================== URL resolution ================================
@@ -971,7 +1047,8 @@ def _fetch_source(adapter: SourceAdapter, query: SearchQuery, ttl: int, now: flo
     """
     collected: list[Job] = []
     status = "error"
-    query_variants = variants or _title_variants(query)
+    max_variants = getattr(adapter, "max_variants", MAX_VARIANTS_PER_SOURCE + 1)
+    query_variants = (variants or _title_variants(query))[: max_variants]
     for v_title in query_variants:
         vq = copy.copy(query)
         vq.title = v_title
@@ -1041,11 +1118,21 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         query.work_types = work_types
         query.location = ""
 
+    # Fast path: an identical repeat search (same query + resume) within the TTL
+    # returns the already-scored result as-is. Only used on the default-adapters
+    # path — explicit `sources=` (tests, custom sets) always run fresh.
+    if sources is None:
+        res_key = _result_cache_key(query, resume_text, target_role)
+        with _RESULT_LOCK:
+            cached = _RESULT_CACHE.get(res_key)
+        if cached and (now - cached[0]) < ttl:
+            return copy.deepcopy(cached[1])
+
     collected: list[Job] = []
     status: dict[str, str] = {}
     query_variants = _title_variants(query)
 
-    max_workers = min(len(adapters), 6)
+    max_workers = max(4, min(len(adapters), 8))
     if len(adapters) <= 1:
         for adapter in adapters:
             jobs, st = _fetch_source(adapter, query, ttl, now, variants=query_variants)
@@ -1170,12 +1257,24 @@ def search_jobs(query: SearchQuery, resume_text: Optional[str] = None,
         else:
             empty_reason = "no_results"
 
-    return {
+    result = {
         "jobs": filtered,
         "status": status,
         "counts": {"total": len(deduped), "shown": len(filtered)},
         "empty_reason": empty_reason,
     }
+
+    # Cache the finished result for the fast path. Skip transient empties so a
+    # sources-unreachable moment isn't frozen for the whole TTL.
+    if sources is None and not (empty_reason == "unreachable" or empty_reason == "no_sources"):
+        with _RESULT_LOCK:
+            _RESULT_CACHE[res_key] = (now, copy.deepcopy(result))
+            if len(_RESULT_CACHE) > _RESULT_CACHE_MAX:
+                # Evict the oldest entry — the cache is content-keyed, order is arbitrary.
+                oldest = min(_RESULT_CACHE, key=lambda k: _RESULT_CACHE[k][0])
+                del _RESULT_CACHE[oldest]
+
+    return result
 
 
 # ============================== HTML Scraper ===================================

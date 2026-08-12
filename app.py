@@ -291,12 +291,16 @@ def _sanitize_db_text(s: str) -> str:
     return s.replace("\x00", "")[:500_000]  # keep first ~500k chars
 
 
-# Initialize database
-try:
+# Initialize database once per server startup (cached across session reruns)
+@st.cache_resource(show_spinner=False)
+def _run_startup_db_init():
     init_db()
     from database import seed_discount_codes
     seed_discount_codes()
     backfill_wallets()
+
+try:
+    _run_startup_db_init()
 except Exception as e:
     from database import get_db_config_summary
     cfg_summary = get_db_config_summary()

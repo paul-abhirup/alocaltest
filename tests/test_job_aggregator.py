@@ -321,7 +321,7 @@ class TestFetchVolume(unittest.TestCase):
     """Volume levers: multi-page fetches and server-side page-size bumps."""
 
     @mock.patch.dict("os.environ", {"JSEARCH_API_KEY": "k"}, clear=True)
-    def test_jsearch_requests_three_pages(self):
+    def test_jsearch_requests_five_pages(self):
         adapter = JSearchAdapter()
         captured = {}
         def fake_get(url, headers, params, timeout):
@@ -329,7 +329,32 @@ class TestFetchVolume(unittest.TestCase):
             return _empty_resp({"data": {"jobs": []}})
         with mock.patch("job_aggregator.requests.get", side_effect=fake_get):
             adapter.fetch(SearchQuery(title="python developer"))
-        self.assertEqual(captured["params"]["num_pages"], "3")
+        self.assertEqual(captured["params"]["num_pages"], "5")
+
+    @mock.patch.dict("os.environ",
+                     {"ADZUNA_APP_ID": "id", "ADZUNA_APP_KEY": "key"}, clear=True)
+    def test_adzuna_three_pages_single_country(self):
+        adapter = AdzunaAdapter()
+        urls = []
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            urls.append(url)
+            return _empty_resp({"results": []})
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            adapter.fetch(SearchQuery(title="python developer", country="us"))
+        self.assertEqual(len(urls), 3)
+
+    @mock.patch.dict("os.environ",
+                     {"ADZUNA_APP_ID": "id", "ADZUNA_APP_KEY": "key"}, clear=True)
+    def test_adzuna_two_pages_all_countries(self):
+        from job_aggregator import _ADZUNA_ALL_COUNTRIES
+        adapter = AdzunaAdapter()
+        urls = []
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            urls.append(url)
+            return _empty_resp({"results": []})
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            adapter.fetch(SearchQuery(title="python developer", country="all"))
+        self.assertEqual(len(urls), 2 * len(_ADZUNA_ALL_COUNTRIES))
 
     @mock.patch.dict("os.environ", {"JOOBLE_API_KEY": "k"}, clear=True)
     def test_jooble_large_page_and_country_fanout(self):
@@ -340,8 +365,11 @@ class TestFetchVolume(unittest.TestCase):
             return _empty_resp({"jobs": []})
         with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
             adapter.fetch(SearchQuery(title="python developer", country="all"))
-        # "" + "United States" + "United Kingdom" fan-out for All Countries
-        self.assertEqual([b["location"] for b in bodies], ["", "United States", "United Kingdom"])
+        # Expanded fan-out for All Countries: US (2×), UK, India, Germany, Canada, Australia
+        self.assertEqual(
+            [b["location"] for b in bodies],
+            ["", "United States", "United Kingdom", "India", "Germany", "Canada", "Australia"],
+        )
         self.assertTrue(all(b["ResultOnPage"] == 100 for b in bodies))
 
     @mock.patch.dict("os.environ", {"FINDWORK_API_KEY": "k"}, clear=True)
@@ -684,5 +712,52 @@ class TestLocationFilter(unittest.TestCase):
         self.assertFalse(is_location_mismatched("Berlin, Germany", "", "all"))
 
 
+class TestMultiCountrySupport(unittest.TestCase):
+    """Test suite for expanded multi-country coverage and API routing."""
+
+    def test_country_dictionaries_synchronized(self):
+        """Ensure all country codes in SUPPORTED_COUNTRIES (except 'all') exist in COUNTRY_FULL_NAMES."""
+        from job_aggregator import SUPPORTED_COUNTRIES, COUNTRY_FULL_NAMES, _ADZUNA_CURRENCY
+        codes = [k for k in SUPPORTED_COUNTRIES if k != "all"]
+        self.assertGreaterEqual(len(codes), 75)
+        for c in codes:
+            self.assertIn(c, COUNTRY_FULL_NAMES, f"Missing country full name for code: {c}")
+            self.assertIn(c, _ADZUNA_CURRENCY, f"Missing currency symbol for code: {c}")
+
+    @mock.patch.dict("os.environ", {"JOOBLE_API_KEY": "test_key"}, clear=True)
+    def test_jooble_routes_subdomains_correctly(self):
+        """Jooble adapter should use regional subdomains for non-US countries."""
+        adapter = JoobleAdapter()
+        called_urls = []
+
+        def fake_request(method, url, params=None, json=None, headers=None, timeout=None, **kw):
+            called_urls.append(url)
+            return _empty_resp({"jobs": []})
+
+        with mock.patch("job_aggregator.requests.request", side_effect=fake_request):
+            # Test India subdomain
+            adapter.fetch(SearchQuery(title="python", country="in"))
+            self.assertTrue(any("https://in.jooble.org/api/test_key" in u for u in called_urls))
+
+            called_urls.clear()
+            # Test UK subdomain (mapped from gb to uk)
+            adapter.fetch(SearchQuery(title="python", country="gb"))
+            self.assertTrue(any("https://uk.jooble.org/api/test_key" in u for u in called_urls))
+
+            called_urls.clear()
+            # Test US main domain
+            adapter.fetch(SearchQuery(title="python", country="us"))
+            self.assertTrue(any("https://jooble.org/api/test_key" in u for u in called_urls))
+
+    @mock.patch.dict("os.environ", {"ADZUNA_APP_ID": "id", "ADZUNA_APP_KEY": "key"}, clear=True)
+    def test_adzuna_skips_unsupported_countries(self):
+        """Adzuna adapter should skip countries it does not support without throwing errors."""
+        adapter = AdzunaAdapter()
+        # Pakistan ('pk') is not in Adzuna's 20 supported countries
+        res = adapter.fetch(SearchQuery(title="python", country="pk"))
+        self.assertEqual(res, [])
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -104,7 +104,58 @@ def is_employment_type_mismatched(wanted_work_types: list[str], job_remote_type:
 
 
 def is_location_mismatched(job_location: str, query_location: str = "", query_country: str = "", job_remote_type: str = "") -> bool:
-    """Location filter disabled: always returns False to include jobs from all locations."""
+    """Phase 7: Location mismatch check.
+    Remote/Contract jobs or queries for 'all' countries bypass this filter.
+    Onsite/Hybrid jobs with a distinct country mismatch are rejected.
+    """
+    if not query_country or query_country.lower() == "all":
+        return False
+
+    # Remote and Contract jobs are accessible globally or have their own work-type filters
+    remote_types = {"Remote (in-country)", "Remote (worldwide)", "Remote — check eligibility", "Contract/Project"}
+    if job_remote_type in remote_types:
+        return False
+
+    loc_clean = (job_location or "").strip()
+    if not loc_clean or loc_clean == "—":
+        return False
+
+    low_loc = loc_clean.lower()
+    if any(k in low_loc for k in ("worldwide", "anywhere", "remote", "global")):
+        return False
+
+    # Check if job location has an explicit country indicator that mismatches query_country
+    q_c = query_country.lower().strip()
+
+    # Common country name and major city indicators
+    country_indicators = {
+        "us": ["united states", "usa", "u.s.", "u.s.a.", ", us", " us", "california", "texas", "new york", "austin", "san francisco", "seattle"],
+        "in": ["india", "bengaluru", "bangalore", "mumbai", "delhi", "hyderabad", "pune", "chennai", "noida", "gurgaon"],
+        "gb": ["united kingdom", "uk", "u.k.", "england", "scotland", "wales", "london", "manchester", "birmingham"],
+        "ca": ["canada", "toronto", "vancouver", "montreal", "ontario", "quebec", "ottawa", "calgary"],
+        "de": ["germany", "deutschland", "berlin", "munich", "münchen", "frankfurt", "hamburg", "cologne", "köln"],
+        "au": ["australia", "sydney", "melbourne", "brisbane", "perth", "adelaide"],
+        "fr": ["france", "paris", "lyon", "marseille", "toulouse"],
+        "es": ["spain", "españa", "madrid", "barcelona", "valencia", "seville"],
+        "it": ["italy", "italia", "rome", "roma", "milan", "milano"],
+        "br": ["brazil", "brasil", "são paulo", "sao paulo", "rio de janeiro"],
+        "mx": ["mexico", "méxico", "mexico city", "guadalajara", "monterrey"],
+        "nl": ["netherlands", "amsterdam", "rotterdam", "the hague", "utrecht"],
+        "pl": ["poland", "polska", "warsaw", "warszawa", "krakow", "kraków", "wroclaw"],
+        "sg": ["singapore"],
+        "za": ["south africa", "johannesburg", "cape town", "durban", "pretoria"],
+    }
+
+    # Check if loc indicates a foreign country that is known and distinct from query_country
+    for c_code, indicators in country_indicators.items():
+        if c_code != q_c:
+            for ind in indicators:
+                if re.search(r"\b" + re.escape(ind) + r"\b", low_loc):
+                    # Make sure the current query country's indicators aren't also present
+                    q_inds = country_indicators.get(q_c, [q_c])
+                    if not any(re.search(r"\b" + re.escape(qi) + r"\b", low_loc) for qi in q_inds):
+                        return True
+
     return False
 
 

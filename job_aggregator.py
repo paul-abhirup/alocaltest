@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # ----------------------------- Tunables ---------------------------------------
 DEFAULT_TIMEOUT = 12           # seconds per source request (multi-page sources need more)
-MAX_RESULTS_PER_SOURCE = 100
+MAX_RESULTS_PER_SOURCE = 150
 MAX_VARIANTS_PER_SOURCE = 2    # search variants fan-out per source (recall boost)
 MAX_DESC_CHARS = 8000         # cap description length before scoring (perf)
 USER_AGENT = "CVOLVE-PRO-JobAggregator/1.0 (+https://cvolvepro.com)"
@@ -62,52 +62,212 @@ ONSITE_HYBRID = "Onsite/Hybrid"
 CONTRACT = "Contract/Project"
 _REMOTE_FAMILY = {REMOTE_IN_COUNTRY, REMOTE_WORLDWIDE, REMOTE_UNKNOWN}
 
+# ----------------------------- Country & Currency Mappings -------------------
+# Markets queried when the user picks "All Countries" (Adzuna fan-out).
+_ADZUNA_ALL_COUNTRIES = ["us", "gb", "in", "de", "ca", "au", "fr", "es", "nl", "br"]
+
 _ADZUNA_CURRENCY = {
     "gb": "£", "us": "$", "ca": "C$", "au": "A$", "in": "₹",
     "de": "€", "fr": "€", "nl": "€", "es": "€", "it": "€",
+    "ie": "€", "at": "€", "be": "€", "pt": "€", "fi": "€", "gr": "€",
+    "cy": "€", "ee": "€", "lt": "€", "lv": "€", "lu": "€", "mt": "€",
+    "sk": "€", "si": "€", "hr": "€",
     "br": "R$", "mx": "Mex$", "pl": "zł", "za": "R", "nz": "NZ$", "sg": "S$",
-    "ie": "€", "at": "€", "be": "€", "ch": "CHF", "pt": "€", "se": "kr",
-    "no": "kr", "dk": "kr", "fi": "€", "jp": "¥", "hk": "HK$",
-    "ae": "AED", "ph": "₱", "my": "RM", "id": "Rp", "ar": "ARG$",
-    "cl": "CLP$", "co": "COL$", "pe": "S/", "cz": "Kč", "ro": "lei",
-    "hu": "Ft", "gr": "€", "il": "₪", "kr": "₩", "tw": "NT$",
-    "th": "฿", "tr": "TRY",
+    "ch": "CHF ", "se": "kr", "no": "kr", "dk": "kr", "is": "kr",
+    "jp": "¥", "hk": "HK$", "ae": "AED ", "sa": "SAR ", "qa": "QAR ", "kw": "KWD ",
+    "bh": "BHD ", "om": "OMR ", "jo": "JOD ", "eg": "EGP ", "ng": "₦", "ke": "KSh ",
+    "gh": "GH₵", "pk": "PKR ", "bd": "৳", "lk": "LKR ", "np": "NPR ",
+    "ph": "₱", "my": "RM", "id": "Rp", "th": "฿", "vn": "₫", "uy": "$U",
+    "kr": "₩", "tw": "NT$", "tr": "TRY ", "il": "₪", "ru": "₽",
+    "ar": "ARG$", "cl": "CLP$", "co": "COL$", "pe": "S/", "py": "₲", "bo": "Bs.",
+    "cr": "₡", "do": "RD$", "ec": "$", "gt": "Q", "pa": "B/.", "pr": "$",
+    "cz": "Kč", "ro": "lei", "hu": "Ft", "bg": "лв", "rs": "дин.", "ua": "₴",
+    "ma": "MAD ", "tn": "TND ", "kz": "₸", "ge": "₾", "mu": "₨",
+}
+
+ADZUNA_SUPPORTED_COUNTRIES = {
+    "at", "au", "be", "br", "ca", "ch", "de", "es", "fr", "gb",
+    "in", "it", "mx", "nl", "nz", "pl", "ru", "sg", "us", "za",
 }
 
 COUNTRY_FULL_NAMES = {
-    "in": "India", "us": "United States", "gb": "United Kingdom",
-    "ca": "Canada", "au": "Australia", "de": "Germany", "fr": "France",
-    "nl": "Netherlands", "es": "Spain", "it": "Italy", "br": "Brazil",
-    "mx": "Mexico", "pl": "Poland", "za": "South Africa", "sg": "Singapore",
+    "ae": "United Arab Emirates",
+    "ar": "Argentina",
+    "at": "Austria",
+    "au": "Australia",
+    "bd": "Bangladesh",
+    "be": "Belgium",
+    "bg": "Bulgaria",
+    "bh": "Bahrain",
+    "bo": "Bolivia",
+    "br": "Brazil",
+    "ca": "Canada",
+    "ch": "Switzerland",
+    "cl": "Chile",
+    "co": "Colombia",
+    "cr": "Costa Rica",
+    "cy": "Cyprus",
+    "cz": "Czech Republic",
+    "de": "Germany",
+    "dk": "Denmark",
+    "do": "Dominican Republic",
+    "ec": "Ecuador",
+    "ee": "Estonia",
+    "eg": "Egypt",
+    "es": "Spain",
+    "fi": "Finland",
+    "fr": "France",
+    "gb": "United Kingdom",
+    "ge": "Georgia",
+    "gh": "Ghana",
+    "gr": "Greece",
+    "gt": "Guatemala",
+    "hk": "Hong Kong",
+    "hr": "Croatia",
+    "hu": "Hungary",
+    "id": "Indonesia",
+    "ie": "Ireland",
+    "il": "Israel",
+    "in": "India",
+    "is": "Iceland",
+    "it": "Italy",
+    "jo": "Jordan",
+    "jp": "Japan",
+    "ke": "Kenya",
+    "kr": "South Korea",
+    "kw": "Kuwait",
+    "kz": "Kazakhstan",
+    "lk": "Sri Lanka",
+    "lt": "Lithuania",
+    "lu": "Luxembourg",
+    "lv": "Latvia",
+    "ma": "Morocco",
+    "mt": "Malta",
+    "mu": "Mauritius",
+    "mx": "Mexico",
+    "my": "Malaysia",
+    "ng": "Nigeria",
+    "nl": "Netherlands",
+    "no": "Norway",
+    "np": "Nepal",
     "nz": "New Zealand",
-    "ie": "Ireland", "at": "Austria", "be": "Belgium", "ch": "Switzerland",
-    "pt": "Portugal", "se": "Sweden", "no": "Norway", "dk": "Denmark",
-    "fi": "Finland", "jp": "Japan", "hk": "Hong Kong", "ae": "United Arab Emirates",
-    "ph": "Philippines", "my": "Malaysia", "id": "Indonesia",
-    "ar": "Argentina", "cl": "Chile", "co": "Colombia", "pe": "Peru",
-    "cz": "Czech Republic", "ro": "Romania", "hu": "Hungary",
-    "gr": "Greece", "il": "Israel", "kr": "South Korea", "tw": "Taiwan",
-    "th": "Thailand", "vn": "Vietnam", "tr": "Turkey", "uy": "Uruguay",
+    "om": "Oman",
+    "pa": "Panama",
+    "pe": "Peru",
+    "ph": "Philippines",
+    "pk": "Pakistan",
+    "pl": "Poland",
+    "pr": "Puerto Rico",
+    "pt": "Portugal",
+    "py": "Paraguay",
+    "qa": "Qatar",
+    "ro": "Romania",
+    "rs": "Serbia",
+    "sa": "Saudi Arabia",
+    "se": "Sweden",
+    "sg": "Singapore",
+    "si": "Slovenia",
+    "sk": "Slovakia",
+    "th": "Thailand",
+    "tn": "Tunisia",
+    "tr": "Turkey",
+    "tw": "Taiwan",
+    "ua": "Ukraine",
+    "us": "United States",
+    "uy": "Uruguay",
+    "vn": "Vietnam",
+    "za": "South Africa",
 }
 
+# Sorted alphabetically by country name; "all" stays on top as the default option.
 SUPPORTED_COUNTRIES = {
     "all": "🌍 All Countries (Global)",
-    "us": "🇺🇸 United States", "gb": "🇬🇧 United Kingdom", "in": "🇮🇳 India",
-    "ca": "🇨🇦 Canada", "au": "🇦🇺 Australia", "de": "🇩🇪 Germany",
-    "fr": "🇫🇷 France", "nl": "🇳🇱 Netherlands", "es": "🇪🇸 Spain",
-    "it": "🇮🇹 Italy", "br": "🇧🇷 Brazil", "mx": "🇲🇽 Mexico",
-    "pl": "🇵🇱 Poland", "za": "🇿🇦 South Africa", "sg": "🇸🇬 Singapore",
+    "ar": "🇦🇷 Argentina",
+    "au": "🇦🇺 Australia",
+    "at": "🇦🇹 Austria",
+    "bh": "🇧🇭 Bahrain",
+    "bd": "🇧🇩 Bangladesh",
+    "be": "🇧🇪 Belgium",
+    "bo": "🇧🇴 Bolivia",
+    "br": "🇧🇷 Brazil",
+    "bg": "🇧🇬 Bulgaria",
+    "ca": "🇨🇦 Canada",
+    "cl": "🇨🇱 Chile",
+    "co": "🇨🇴 Colombia",
+    "cr": "🇨🇷 Costa Rica",
+    "hr": "🇭🇷 Croatia",
+    "cy": "🇨🇾 Cyprus",
+    "cz": "🇨🇿 Czech Republic",
+    "dk": "🇩🇰 Denmark",
+    "do": "🇩🇴 Dominican Republic",
+    "ec": "🇪🇨 Ecuador",
+    "eg": "🇪🇬 Egypt",
+    "ee": "🇪🇪 Estonia",
+    "fi": "🇫🇮 Finland",
+    "fr": "🇫🇷 France",
+    "ge": "🇬🇪 Georgia",
+    "de": "🇩🇪 Germany",
+    "gh": "🇬🇭 Ghana",
+    "gr": "🇬🇷 Greece",
+    "gt": "🇬🇹 Guatemala",
+    "hk": "🇭🇰 Hong Kong",
+    "hu": "🇭🇺 Hungary",
+    "is": "🇮🇸 Iceland",
+    "in": "🇮🇳 India",
+    "id": "🇮🇩 Indonesia",
+    "ie": "🇮🇪 Ireland",
+    "il": "🇮🇱 Israel",
+    "it": "🇮🇹 Italy",
+    "jp": "🇯🇵 Japan",
+    "jo": "🇯🇴 Jordan",
+    "kz": "🇰🇿 Kazakhstan",
+    "ke": "🇰🇪 Kenya",
+    "kw": "🇰🇼 Kuwait",
+    "lv": "🇱🇻 Latvia",
+    "lt": "🇱🇹 Lithuania",
+    "lu": "🇱🇺 Luxembourg",
+    "my": "🇲🇾 Malaysia",
+    "mt": "🇲🇹 Malta",
+    "mu": "🇲🇺 Mauritius",
+    "mx": "🇲🇽 Mexico",
+    "ma": "🇲🇦 Morocco",
+    "np": "🇳🇵 Nepal",
+    "nl": "🇳🇱 Netherlands",
     "nz": "🇳🇿 New Zealand",
-    "ie": "🇮🇪 Ireland", "at": "🇦🇹 Austria", "be": "🇧🇪 Belgium",
-    "ch": "🇨🇭 Switzerland", "pt": "🇵🇹 Portugal", "se": "🇸🇪 Sweden",
-    "no": "🇳🇴 Norway", "dk": "🇩🇰 Denmark", "fi": "🇫🇮 Finland",
-    "jp": "🇯🇵 Japan", "hk": "🇭🇰 Hong Kong", "ae": "🇦🇪 UAE",
-    "ph": "🇵🇭 Philippines", "my": "🇲🇾 Malaysia", "id": "🇮🇩 Indonesia",
-    "ar": "🇦🇷 Argentina", "cl": "🇨🇱 Chile", "co": "🇨🇴 Colombia",
-    "pe": "🇵🇪 Peru", "cz": "🇨🇿 Czech Republic", "ro": "🇷🇴 Romania",
-    "hu": "🇭🇺 Hungary", "gr": "🇬🇷 Greece", "il": "🇮🇱 Israel",
-    "kr": "🇰🇷 South Korea", "tw": "🇹🇼 Taiwan", "th": "🇹🇭 Thailand",
-    "vn": "🇻🇳 Vietnam", "tr": "🇹🇷 Turkey",
+    "ng": "🇳🇬 Nigeria",
+    "no": "🇳🇴 Norway",
+    "om": "🇴🇲 Oman",
+    "pk": "🇵🇰 Pakistan",
+    "pa": "🇵🇦 Panama",
+    "py": "🇵🇾 Paraguay",
+    "pe": "🇵🇪 Peru",
+    "ph": "🇵🇭 Philippines",
+    "pl": "🇵🇱 Poland",
+    "pt": "🇵🇹 Portugal",
+    "pr": "🇵🇷 Puerto Rico",
+    "qa": "🇶🇦 Qatar",
+    "ro": "🇷🇴 Romania",
+    "sa": "🇸🇦 Saudi Arabia",
+    "rs": "🇷🇸 Serbia",
+    "sg": "🇸🇬 Singapore",
+    "sk": "🇸🇰 Slovakia",
+    "si": "🇸🇮 Slovenia",
+    "za": "🇿🇦 South Africa",
+    "kr": "🇰🇷 South Korea",
+    "es": "🇪🇸 Spain",
+    "lk": "🇱🇰 Sri Lanka",
+    "se": "🇸🇪 Sweden",
+    "ch": "🇨🇭 Switzerland",
+    "tw": "🇹🇼 Taiwan",
+    "th": "🇹🇭 Thailand",
+    "tn": "🇹🇳 Tunisia",
+    "tr": "🇹🇷 Turkey",
+    "ae": "🇦🇪 UAE",
+    "ua": "🇺🇦 Ukraine",
+    "gb": "🇬🇧 United Kingdom",
+    "us": "🇺🇸 United States",
+    "uy": "🇺🇾 Uruguay",
+    "vn": "🇻🇳 Vietnam",
 }
 
 
@@ -424,7 +584,7 @@ class ArbeitnowAdapter(SourceAdapter):
 class AdzunaAdapter(SourceAdapter):
     source = "adzuna"
     source_name = "Adzuna"
-    max_variants = 1      # multi-country × 2 pages is already expensive; main title only
+    max_variants = 1      # All-Countries fan-out (10 markets × pages) is already expensive; main title only
     BASE = "https://api.adzuna.com/v1/api/jobs"
 
     def __init__(self):
@@ -437,12 +597,16 @@ class AdzunaAdapter(SourceAdapter):
 
     def fetch(self, query):
         country = (query.country or "gb").lower()
-        # "All Countries" queries the top markets instead of just US+GB.
-        target_countries = ["us", "gb", "in", "de", "ca", "au"] if country == "all" else [country]
+        if country != "all" and country not in ADZUNA_SUPPORTED_COUNTRIES:
+            # Adzuna API only operates in 20 supported countries. Skip to avoid redundant 400/404 errors.
+            return []
+        # "All Countries" queries top regional markets.
+        target_countries = _ADZUNA_ALL_COUNTRIES if country == "all" else [country]
         per_page = min(50, max(20, query.limit // len(target_countries)))
-        # Paginate through 2 pages per country for volume, even when fanning out
-        # across many countries.
-        pages = 2
+        # Single-country searches page through 3 pages for volume; the All-Countries
+        # fan-out already spreads thin across 10 markets, so keep it at 2 pages there
+        # to bound request count and latency.
+        pages = 2 if country == "all" else 3
         all_results = []
         wants = set(query.work_types or [])
         wants_remote = bool(wants & _REMOTE_FAMILY) and ONSITE_HYBRID not in wants
@@ -529,6 +693,21 @@ class JSearchAdapter(SourceAdapter):
             self.api_key = os.getenv("JSEARCH_API_KEY")
         return bool(self.api_key)
 
+    # Language hints for non-English markets — improves JSearch recall by
+    # requesting results in the local language alongside English.
+    _JSEARCH_LANG = {
+        "de": "de", "fr": "fr", "es": "es", "it": "it", "pt": "pt",
+        "nl": "nl", "pl": "pl", "br": "pt", "mx": "es", "ar": "es",
+        "cl": "es", "co": "es", "pe": "es", "ec": "es", "cr": "es",
+        "gt": "es", "do": "es", "bo": "es", "py": "es", "uy": "es",
+        "jp": "ja", "kr": "ko", "th": "th", "vn": "vi", "id": "id",
+        "tr": "tr", "cz": "cs", "ro": "ro", "hu": "hu", "bg": "bg",
+        "rs": "sr", "ua": "uk", "se": "sv", "no": "no", "dk": "da",
+        "fi": "fi", "gr": "el", "il": "he", "eg": "ar", "sa": "ar",
+        "ae": "ar", "qa": "ar", "kw": "ar", "bh": "ar", "om": "ar",
+        "jo": "ar", "ma": "fr", "tn": "fr",
+    }
+
     def fetch(self, query):
         if not self.api_key:
             self.api_key = os.getenv("JSEARCH_API_KEY")
@@ -542,15 +721,20 @@ class JSearchAdapter(SourceAdapter):
         if query.location:
             q_text += f" in {query.location}"
 
-        # Request 3 pages (30 results) per query variant via a single request so JSearch
-        # volume isn't capped at 10 rows while keeping each request fast enough.
-        params = {"query": q_text, "page": "1", "num_pages": "3"}
-        if query.country and query.country.lower() != "all":
+        # Request up to 5 pages (≈50 results) per query variant via a single request so
+        # JSearch volume isn't capped at 10 rows while keeping each request fast enough.
+        params = {"query": q_text, "page": "1", "num_pages": "5"}
+        cc = (query.country or "").lower()
+        if cc and cc != "all":
             wants = set(query.work_types or [])
             # When only worldwide remote is selected, don't lock by country
             if not (REMOTE_WORLDWIDE in wants and REMOTE_IN_COUNTRY not in wants
                     and ONSITE_HYBRID not in wants):
-                params["country"] = query.country.lower()
+                params["country"] = cc
+            # Add language hint for non-English markets
+            lang = self._JSEARCH_LANG.get(cc)
+            if lang:
+                params["language"] = lang
         wants = set(query.work_types or [])
         if wants & _REMOTE_FAMILY and ONSITE_HYBRID not in wants:
             params["remote_jobs_only"] = "true"
@@ -619,6 +803,13 @@ class JSearchAdapter(SourceAdapter):
         )
 
 
+JOOBLE_COUNTRY_DOMAINS = {
+    "us": "https://jooble.org",
+    "gb": "https://uk.jooble.org",
+    "uk": "https://uk.jooble.org",
+}
+
+
 class JoobleAdapter(SourceAdapter):
     source = "jooble"
     source_name = "Jooble"
@@ -630,30 +821,60 @@ class JoobleAdapter(SourceAdapter):
     def enabled(self):
         return bool(self.api_key)
 
+    def _get_api_url(self, country_code: str) -> str:
+        cc = (country_code or "").lower().strip()
+        if not cc or cc in ("all", "us"):
+            domain = "https://jooble.org"
+        elif cc in JOOBLE_COUNTRY_DOMAINS:
+            domain = JOOBLE_COUNTRY_DOMAINS[cc]
+        else:
+            domain = f"https://{cc}.jooble.org"
+        return f"{domain}/api/{self.api_key}"
+
     def fetch(self, query):
-        url = f"{self.BASE}/{self.api_key}"
-        c_name = COUNTRY_FULL_NAMES.get((query.country or "").lower(), query.country or "")
+        country_raw = (query.country or "").lower().strip()
+        c_name = COUNTRY_FULL_NAMES.get(country_raw, query.country or "")
         wants = set(query.work_types or [])
         # When only worldwide remote is selected, don't force a country in location
         if REMOTE_WORLDWIDE in wants and REMOTE_IN_COUNTRY not in wants and ONSITE_HYBRID not in wants:
             loc = query.location or ""
         else:
-            loc = query.location or (c_name if query.country and query.country.lower() != "all" else "")
+            loc = query.location or (c_name if query.country and country_raw != "all" else "")
         # "All Countries" fans out across the biggest markets — Jooble returns a
         # far larger, location-sorted pool this way (empty location alone is thin).
-        if query.country and query.country.lower() == "all":
-            buckets = ["", "United States", "United Kingdom"]
+        if country_raw == "all":
+            buckets = [
+                ("https://jooble.org/api", ""),
+                ("https://jooble.org/api", "United States"),
+                ("https://uk.jooble.org/api", "United Kingdom"),
+                ("https://in.jooble.org/api", "India"),
+                ("https://de.jooble.org/api", "Germany"),
+                ("https://ca.jooble.org/api", "Canada"),
+                ("https://au.jooble.org/api", "Australia"),
+            ]
         else:
-            buckets = [loc]
+            base_url = self._get_api_url(country_raw).rsplit("/", 1)[0]
+            buckets = [(base_url, loc)]
         results = []
-        for b in buckets:
+        for base_url, b in buckets:
+            url = f"{base_url}/{self.api_key}"
             payload = {"keywords": query.title, "location": b, "ResultOnPage": 100}
             try:
                 data = self._request(url, method="POST", json_body=payload)
+                results.extend(data.get("jobs") or [])
             except Exception as e:
-                logger.warning("Jooble fetch failed (location %r): %s", b, e)
+                # If regional domain fails, try fallback to main domain
+                if base_url != "https://jooble.org/api":
+                    fb_url = f"{self.BASE}/{self.api_key}"
+                    fb_payload = {"keywords": query.title, "location": query.location or c_name, "ResultOnPage": 100}
+                    try:
+                        data = self._request(fb_url, method="POST", json_body=fb_payload)
+                        results.extend(data.get("jobs") or [])
+                    except Exception as fb_err:
+                        logger.warning("Jooble fallback fetch failed (location %r): %s", b, fb_err)
+                else:
+                    logger.warning("Jooble fetch failed (location %r): %s", b, e)
                 continue
-            results.extend(data.get("jobs") or [])
         return results[: query.limit * 2]
 
     def normalize(self, raw):

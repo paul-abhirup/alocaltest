@@ -1282,28 +1282,13 @@ def _render_steps_1_and_2(email: str, resume_text: str, active_file) -> None:
         with c2:
             yoe = st.number_input("Years of Experience", min_value=0, max_value=50, value=0, step=1, key="ja_yoe")
             
-        supported_countries = getattr(ja, "SUPPORTED_COUNTRIES", {
-            "all": "🌍 All Countries (Global)",
-            "us": "🇺🇸 United States",
-            "gb": "🇬🇧 United Kingdom",
-            "in": "🇮🇳 India",
-            "ca": "🇨🇦 Canada",
-            "au": "🇦🇺 Australia",
-            "de": "🇩🇪 Germany",
-            "fr": "🇫🇷 France",
-            "nl": "🇳🇱 Netherlands",
-            "es": "🇪🇸 Spain",
-            "it": "🇮🇹 Italy",
-            "br": "🇧🇷 Brazil",
-            "mx": "🇲🇽 Mexico",
-            "pl": "🇵🇱 Poland",
-            "za": "🇿🇦 South Africa",
-            "sg": "🇸🇬 Singapore",
-            "nz": "🇳🇿 New Zealand",
-        })
+        supported_countries = ja.SUPPORTED_COUNTRIES
         country = st.selectbox(
             "Country / Region",
-            options=list(supported_countries.keys()),
+            options=["all"] + sorted(
+                [k for k in supported_countries if k != "all"],
+                key=lambda k: supported_countries[k].split(" ", 1)[-1],
+            ),
             format_func=lambda x: str(supported_countries.get(x, (x or "").upper())),
             index=0,
             key="ja_country"
